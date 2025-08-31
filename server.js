@@ -8,8 +8,6 @@ import { fileURLToPath } from "node:url";
 import fs from "node:fs/promises";
 import QRCode from "qrcode";
 
-// 👇 Baileys: separa el Store del resto para evitar el error
-import { makeInMemoryStore } from "@whiskeysockets/baileys/lib/Store.js";
 import makeWASocket, {
   useMultiFileAuthState,
   fetchLatestBaileysVersion,
@@ -18,359 +16,404 @@ import makeWASocket, {
   Browsers,
 } from "@whiskeysockets/baileys";
 
+// --- Baileys Store: import resiliente (Store.js vs store.js) ---
+let makeInMemoryStore;
+try {
+  ({ makeInMemoryStore } = await import("@whiskeysockets/baileys/lib/Store.js"));
+} catch {
+  ({ makeInMemoryStore } = await import("@whiskeysockets/baileys/lib/store.js"));
+}
 
 // ---------- Config ----------
-
 const PORT = process.env.PORT || 3000;
-const API_KEY = process.env.API_KEY || "changeme";
+const API_KEY = process.env.API_KEY || ""; // ej: "Nicolasperes00*!"
 const ALLOWED_ORIGIN = process.env.ALLOWED_ORIGIN || "*";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
+const AUTH_DIR = path.join(__dirname, "auth");
 
-const log = pino({ level: "info" });
+// ---------- Infra ----------
 const app = express();
-
-app.use(express.json());
+app.use(express.json({ limit: "1mb" }));
 app.use(
   cors({
     origin: ALLOWED_ORIGIN === "*" ? true : ALLOWED_ORIGIN,
-    credentials: false
+    credentials: false,
   })
 );
 
-// API key guard
-app.use((req, res, next) => {
-  const key = req.header("x-api-key");
-  if (!API_KEY) return res.status(500).json({ error: "Missing API_KEY env" });
+// Logger
+const logger = pino({ level: process.env.LOG_LEVEL || "info" });
+
+// Memoria de runtime
+/** @typedef {{ sock:any, store:any, state:any, saveCreds:Function, connected:boolean, lastQr:string|null }} Session */
+const sessions = new Map(); // sessionId => Session
+
+// ---------- Helpers ----------
+function requireApiKey(req, res, next) {
+  const key = req.header("x-api-key") || "";
+  if (!API_KEY) return res.status(500).json({ error: "API key not configured" });
   if (key !== API_KEY) return res.status(401).json({ error: "Unauthorized" });
-  next();
-});
+  return next();
+}
 
-// ---------- Sesiones en memoria ----------
-
-/**
- * sessions: Map<sessionId, {
- *   sock,
- *   store,
- *   state,
- *   startPromise,
- *   lastQr,                 // string (raw) del último QR
- *   lastQrPng,              // Buffer PNG
- *   connected: boolean,
- *   sseClients: Set<res>,   // conexiones SSE de ese sessionId
- * }>
- */
-const sessions = new Map();
-
-// util FS
 async function ensureDir(dir) {
   await fs.mkdir(dir, { recursive: true });
 }
 
-async function removeDir(dir) {
+function ok(res, data = {}) {
+  return res.json({ ok: true, ...data });
+}
+
+function fail(res, code, err) {
+  logger.error({ err }, "Request error");
+  return res.status(code).json({ error: String(err?.message || err) });
+}
+
+function jidToHuman(jid) {
   try {
-    await fs.rm(dir, { recursive: true, force: true });
-  } catch {}
+    const d = jidDecode(jid);
+    if (!d?.user) return jid;
+    return `${d.user}${d.server ? "@" + d.server : ""}`;
+  } catch {
+    return jid;
+  }
 }
 
-// ---------- Helper: crear/iniciar sesión ----------
+// “Poblar” store con algunos chats/mensajes
+async function softRefreshChats(sessionId, limit = 50) {
+  const s = sessions.get(sessionId);
+  if (!s?.sock) return;
 
+  try {
+    // Llamada “suave” que acostumbra a poblar la store.
+    await s.sock.ws?.sendRawMessage?.(
+      JSON.stringify({ tag: "query", content: "chats", limit })
+    );
+  } catch (e) {
+    logger.warn({ e }, "softRefreshChats ws.sendRawMessage failed (non-fatal)");
+  }
+}
+
+// Force refresh: usa la API para pedir la lista
+async function forceLoadChats(sessionId, limit = 200) {
+  const s = sessions.get(sessionId);
+  if (!s?.sock) return;
+  try {
+    await s.sock?.fetchPrivacySettings?.(); // innocua
+    // No hay API pública “fetchChats”; nos apoyamos en la store y/o
+    // en el efecto de las notificaciones de history.
+    await softRefreshChats(sessionId, limit);
+  } catch (e) {
+    logger.warn({ e }, "forceLoadChats failed (non-fatal)");
+  }
+}
+
+// ---------- Core: start socket ----------
 async function startSession(sessionId) {
-  if (sessions.get(sessionId)?.sock) {
-    // ya existe y está iniciada
-    return sessions.get(sessionId);
-  }
+  await ensureDir(AUTH_DIR);
+  const sessionDir = path.join(AUTH_DIR, sessionId);
+  await ensureDir(sessionDir);
 
-  // evita doble arranque
-  if (sessions.get(sessionId)?.startPromise) {
-    return sessions.get(sessionId).startPromise;
-  }
+  const { state, saveCreds } = await useMultiFileAuthState(sessionDir);
+  const store = makeInMemoryStore({ logger });
 
-  const startPromise = (async () => {
-    const authDir = path.join(__dirname, "auth", sessionId);
-    await ensureDir(authDir);
+  const { version } = await fetchLatestBaileysVersion();
+  const sock = makeWASocket({
+    version,
+    printQRInTerminal: false,
+    auth: state,
+    browser: Browsers.appropriate("Veroz/Service"),
+    syncFullHistory: false, // reduce carga
+    logger,
+  });
 
-    const { state, saveCreds } = await useMultiFileAuthState(authDir);
-    const store = makeInMemoryStore({ logger: log });
+  store.bind(sock.ev);
 
-    const { version } = await fetchLatestBaileysVersion();
-    log.info({ version }, "Using WA Web version");
+  const s = {
+    sock,
+    store,
+    state,
+    saveCreds,
+    connected: false,
+    lastQr: null,
+  };
+  sessions.set(sessionId, s);
 
-    const sock = makeWASocket({
-      printQRInTerminal: false,
-      auth: state,
-      version,
-      browser: ["Bolt", "Chrome", "121.0"],
-      logger: log
-    });
+  // Eventos
+  sock.ev.on("creds.update", async () => {
+    await saveCreds();
+    // si quieres emitir por SSE, el stream ya lo maneja abajo
+  });
 
-    store.bind(sock.ev);
-
-    const sess = {
-      sock,
-      store,
-      state,
-      startPromise: null,
-      lastQr: null,
-      lastQrPng: null,
-      connected: false,
-      sseClients: new Set()
-    };
-
-    sessions.set(sessionId, sess);
-
-    // Eventos
-    sock.ev.on("creds.update", saveCreds);
-    sock.ev.on("connection.update", async (u) => {
-      const { connection, lastDisconnect, qr } = u;
-
-      if (qr) {
-        sess.lastQr = qr;
-        try {
-          sess.lastQrPng = await QRCode.toBuffer(qr, { width: 320 });
-        } catch (e) {
-          log.error({ err: e }, "QR png generation failed");
-          sess.lastQrPng = null;
-        }
-        pushSse(sessionId, "qr.update", { hasQr: true });
+  sock.ev.on("connection.update", (u) => {
+    const { connection, lastDisconnect, qr } = u;
+    if (qr) {
+      s.lastQr = qr;
+    }
+    if (connection === "open") {
+      s.connected = true;
+      logger.info({ sessionId }, "WA connected");
+    } else if (connection === "close") {
+      s.connected = false;
+      const code = lastDisconnect?.error?.output?.statusCode || lastDisconnect?.error?.code;
+      if (code === DisconnectReason.loggedOut) {
+        logger.warn({ sessionId }, "Logged out, clearing session");
+        sessions.delete(sessionId);
+      } else {
+        logger.warn({ sessionId, code }, "Connection closed");
       }
+    }
+  });
 
-      if (connection === "open") {
-        sess.connected = true;
-        log.info({ sessionId }, "WA connection opened");
-        pushSse(sessionId, "connection.update", { connected: true });
-      } else if (connection === "close") {
-        sess.connected = false;
-        const code = lastDisconnect?.error?.output?.statusCode;
-        log.warn({ sessionId, code }, "WA connection closed");
-        pushSse(sessionId, "connection.update", { connected: false });
+  // “Despierte” la store
+  setTimeout(() => softRefreshChats(sessionId, 50), 2000);
 
-        // Reconnect si no es logout explícito
-        if (code && code !== DisconnectReason.loggedOut) {
-          log.info({ sessionId }, "Trying to reconnect...");
-          setTimeout(() => startSession(sessionId).catch(() => {}), 2000);
-        }
-      }
-    });
-
-    // Reenvía eventos de mensajes/chats a SSE
-    sock.ev.on("messages.upsert", (payload) => {
-      pushSse(sessionId, "messages.upsert", payload);
-    });
-    sock.ev.on("chats.upsert", (payload) => {
-      pushSse(sessionId, "chats.upsert", payload);
-    });
-    sock.ev.on("chats.update", (payload) => {
-      pushSse(sessionId, "chats.update", payload);
-    });
-    sock.ev.on("creds.update", () => {
-      pushSse(sessionId, "creds.update", {});
-    });
-
-    return sess;
-  })();
-
-  sessions.set(sessionId, { startPromise });
-  const sess = await startPromise;
-  return sess;
+  return s;
 }
 
-// ---------- SSE helper ----------
-
-function pushSse(sessionId, event, data) {
-  const sess = sessions.get(sessionId);
-  if (!sess?.sseClients?.size) return;
-  const payload = typeof data === "string" ? data : JSON.stringify({ sessionId, payload: data, ts: Date.now() });
-  for (const res of sess.sseClients) {
-    res.write(`event: ${event}\n`);
-    res.write(`data: ${payload}\n\n`);
-  }
+function getSession(sessionId) {
+  return sessions.get(sessionId);
 }
 
-// ---------- Rutas ----------
+// ---------- Endpoints ----------
 
-// Salud
-app.get("/", (req, res) => {
-  res.json({ ok: true, service: "baileys-microservice" });
-});
+// Health
+app.get("/", (req, res) => ok(res, { service: "baileys-microservice" }));
 
-// Crear o (re)cargar sesión
-app.post("/sessions", async (req, res) => {
+// Crear / recargar sesión
+app.post("/sessions", requireApiKey, async (req, res) => {
   try {
     const { sessionId } = req.body || {};
     if (!sessionId) return res.status(400).json({ error: "Missing 'sessionId'" });
 
-    const sess = await startSession(sessionId);
-    res.json({ ok: true, sessionId });
+    let s = getSession(sessionId);
+    if (!s) {
+      s = await startSession(sessionId);
+    }
+    return ok(res, { sessionId });
   } catch (e) {
-    log.error({ err: e }, "create session error");
-    res.status(500).json({ error: String(e.message || e) });
+    return fail(res, 500, e);
   }
 });
 
 // Estado
-app.get("/sessions/:id/status", async (req, res) => {
+app.get("/sessions/:id/status", requireApiKey, async (req, res) => {
   try {
     const { id } = req.params;
-    const sess = sessions.get(id);
-    if (!sess?.sock) return res.json({ ok: true, connected: false, me: null });
+    const s = getSession(id);
+    if (!s) return res.status(400).json({ error: "Session not found" });
 
-    res.json({
-      ok: true,
-      connected: !!sess.connected,
-      me: sess.sock?.user || null
+    return ok(res, {
+      connected: !!s.connected,
+      me: s.sock?.user || null,
     });
   } catch (e) {
-    res.status(500).json({ error: String(e.message || e) });
+    return fail(res, 500, e);
   }
 });
 
-// QR como PNG
-app.get("/sessions/:id/qr.png", async (req, res) => {
+// QR
+app.get("/sessions/:id/qr.png", requireApiKey, async (req, res) => {
   try {
     const { id } = req.params;
-    const sess = sessions.get(id);
-    if (!sess) return res.status(404).send("Session not found");
+    let s = getSession(id);
+    if (!s) s = await startSession(id);
 
-    // Si no está arrancada, arráncala (para emitir QR)
-    if (!sess.sock) await startSession(id);
-
-    if (!sessions.get(id)?.lastQrPng) {
+    if (s.connected) {
+      // Ya conectado: no hay QR
+      res.type("text/plain").status(200).send("Already connected");
+      return;
+    }
+    if (!s.lastQr) {
       return res.status(404).send("QR not ready");
     }
+    const dataUrl = await QRCode.toDataURL(s.lastQr, { margin: 1, scale: 6 });
+    const base64 = dataUrl.split(",")[1];
+    const buf = Buffer.from(base64, "base64");
 
     res.setHeader("Content-Type", "image/png");
-    res.send(sessions.get(id).lastQrPng);
+    res.setHeader("Content-Length", buf.length);
+    res.status(200).send(buf);
   } catch (e) {
-    res.status(500).send("QR error");
+    fail(res, 500, e);
   }
 });
 
-// Lista de chats
-app.get("/sessions/:id/chats", async (req, res) => {
+// Listar chats (opcional force y limit)
+app.get("/sessions/:id/chats", requireApiKey, async (req, res) => {
   try {
     const { id } = req.params;
-    const force = req.query.force === "1" || req.query.force === "true";
-    const limit = Number(req.query.limit || 200);
+    const { force, limit } = req.query;
+    const s = getSession(id);
+    if (!s) return res.status(400).json({ error: "Session not found" });
 
-    const sess = sessions.get(id);
-    if (!sess?.sock) return res.status(404).json({ error: "Session not found" });
+    const lim = Math.min(Number(limit) || 50, 500);
 
-    // Si quieres forzar refresco (primera vez, etc.)
-    if (force) {
-      try {
-        // cargar algo del historial ayuda a poblar el store
-        await sess.sock.presenceSubscribe(sess.sock.user?.id);
-      } catch {}
+    if (String(force) === "1") {
+      await forceLoadChats(id, lim);
+      // pequeña espera para permitir poblar la store
+      await new Promise((r) => setTimeout(r, 800));
     }
 
-    // store.chats.all() devuelve { id, name, ... } si ya se pobló
-    const all = sess.store?.chats?.all?.() || [];
-    res.json({ ok: true, chats: all.slice(0, limit) });
+    const chatsArr = s.store?.chats?.all() || [];
+    // Normaliza mínimo: id (jid) y nombre pushName si está
+    const data = chatsArr.map((c) => ({
+      id: c.id,
+      name: c.name || c.subject || jidToHuman(c.id),
+      unreadCount: c.unreadCount || 0,
+    }));
+
+    return ok(res, { chats: data });
   } catch (e) {
-    res.status(500).json({ error: String(e.message || e) });
+    return fail(res, 500, e);
   }
 });
 
-// Lista de mensajes de un chat (usar jid URL-encoded)
-app.get("/sessions/:id/messages", async (req, res) => {
+// Listar mensajes de un chat (usar ?jid=... url-encoded)
+app.get("/sessions/:id/messages", requireApiKey, async (req, res) => {
   try {
     const { id } = req.params;
-    let { jid, count } = req.query;
+    const { jid } = req.query;
     if (!jid) return res.status(400).json({ error: "Missing 'jid' query param" });
 
-    jid = decodeURIComponent(jid);
-    count = Number(count || 50);
+    const s = getSession(id);
+    if (!s) return res.status(400).json({ error: "Session not found" });
 
-    const sess = sessions.get(id);
-    if (!sess?.sock) return res.status(404).json({ error: "Session not found" });
+    const msgs = s.store?.messages?.get(jid) || [];
+    // Normaliza un poco la estructura
+    const mapped = msgs.map((m) => {
+      const content = m.message?.conversation
+        ?? m.message?.extendedTextMessage?.text
+        ?? m.message?.imageMessage
+        ?? m.message?.videoMessage
+        ?? m.message?.buttonsResponseMessage
+        ?? m.message?.templateButtonReplyMessage
+        ?? m.message?.audioMessage
+        ?? null;
 
-    // intenta store primero
-    const fromStore = sess.store?.messages?.[jid];
-    if (fromStore?.array?.length) {
-      return res.json({ ok: true, messages: fromStore.array.slice(-count) });
-    }
+      return {
+        key: m.key,
+        pushName: m.pushName,
+        messageTimestamp: m.messageTimestamp,
+        fromMe: m.key?.fromMe || false,
+        status: m.status ?? null,
+        message: content,
+      };
+    });
 
-    // si no hay en store, pide a WhatsApp
-    const msgs = await sess.sock.loadMessages(jid, count);
-    res.json({ ok: true, messages: msgs || [] });
+    return ok(res, { messages: mapped });
   } catch (e) {
-    res.status(500).json({ error: String(e.message || e) });
+    return fail(res, 500, e);
   }
 });
 
-// Enviar mensaje
-app.post("/sessions/:id/send", async (req, res) => {
+// Enviar mensaje de texto
+app.post("/sessions/:id/send", requireApiKey, async (req, res) => {
   try {
     const { id } = req.params;
     const { to, text } = req.body || {};
     if (!to || !text) return res.status(400).json({ error: "Missing 'to' or 'text'" });
 
-    // Normaliza JID para individuos: E164@s.whatsapp.net
-    let jid = to;
-    if (!/@g\.us$/.test(jid) && !/@s\.whatsapp\.net$/.test(jid)) {
-      // e.g. 57321...  => 57321...@s.whatsapp.net
-      jid = `${to}@s.whatsapp.net`;
+    // Validación simple de JID
+    if (!/@s\.whatsapp\.net$|@g\.us$/.test(to)) {
+      return res.status(400).json({
+        error: "Invalid jid. For individuals use <E164>@s.whatsapp.net",
+      });
     }
 
-    const sess = sessions.get(id);
-    if (!sess?.sock || !sess.connected) return res.status(400).json({ error: "Not connected" });
+    const s = getSession(id);
+    if (!s || !s.connected) {
+      return res.status(400).json({ error: "Not connected. Create session and scan QR." });
+    }
 
-    const r = await sess.sock.sendMessage(jid, { text });
-    res.json({ ok: true, id: r?.key?.id || null });
+    const r = await s.sock.sendMessage(to, { text });
+    return ok(res, { id: r.key?.id || null });
   } catch (e) {
-    log.error({ err: e }, "send error");
-    res.status(500).json({ error: String(e.message || e) });
+    return fail(res, 500, e);
   }
 });
 
-// SSE en vivo
-app.get("/sessions/:id/stream", async (req, res) => {
+// SSE: stream en vivo
+app.get("/sessions/:id/stream", requireApiKey, async (req, res) => {
   try {
     const { id } = req.params;
-    const sess = sessions.get(id) || (await startSession(id));
+    const s = getSession(id);
+    if (!s) return res.status(400).json({ error: "Session not found" });
 
-    // cabeceras SSE
     res.setHeader("Content-Type", "text/event-stream");
     res.setHeader("Cache-Control", "no-cache, no-transform");
     res.setHeader("Connection", "keep-alive");
+    res.flushHeaders?.();
 
-    // conexión abierta
-    res.write(`event: ready\n`);
-    res.write(`data: ${JSON.stringify({ ts: Date.now() })}\n\n`);
+    const send = (event, data) => {
+      res.write(`event: ${event}\n`);
+      res.write(`data: ${JSON.stringify(data)}\n\n`);
+    };
 
-    sess.sseClients.add(res);
+    // Marca de listo
+    send("ready", { ts: Date.now() });
+
+    // Suscripciones
+    const unsub = [];
+
+    unsub.push(
+      s.sock.ev.on("messages.upsert", (payload) => {
+        send("messages.upsert", { sessionId: id, payload, ts: Date.now() });
+      })
+    );
+    unsub.push(
+      s.sock.ev.on("chats.update", (payload) => {
+        send("chats.update", { sessionId: id, payload, ts: Date.now() });
+      })
+    );
+    unsub.push(
+      s.sock.ev.on("creds.update", (payload) => {
+        send("creds.update", { sessionId: id, payload, ts: Date.now() });
+      })
+    );
+    unsub.push(
+      s.sock.ev.on("connection.update", (payload) => {
+        send("connection.update", { sessionId: id, payload, ts: Date.now() });
+      })
+    );
+
+    // Ping keep-alive
+    const ping = setInterval(() => send("ping", { ts: Date.now() }), 25000);
 
     req.on("close", () => {
-      sess.sseClients.delete(res);
+      try {
+        clearInterval(ping);
+        unsub.forEach((u) => u && typeof u === "function" && u());
+      } catch {}
+      res.end();
     });
   } catch (e) {
-    res.status(500).end();
+    return fail(res, 500, e);
   }
 });
 
-// Borrar sesión (logout + borrar auth)
-app.delete("/sessions/:id", async (req, res) => {
+// Borrar sesión (opcional)
+app.delete("/sessions/:id", requireApiKey, async (req, res) => {
   try {
     const { id } = req.params;
-    const sess = sessions.get(id);
-    if (sess?.sock) {
-      try { await sess.sock.logout(); } catch {}
-      try { sess.sock.end?.(); } catch {}
+    const s = getSession(id);
+    if (s) {
+      try { await s.sock.logout?.(); } catch {}
+      sessions.delete(id);
     }
-    sessions.delete(id);
-
-    const authDir = path.join(__dirname, "auth", id);
-    await removeDir(authDir);
-
-    res.json({ ok: true, sessionId: id, deleted: true });
+    // limpiar auth
+    const dir = path.join(AUTH_DIR, id);
+    try { await fs.rm(dir, { recursive: true, force: true }); } catch {}
+    return ok(res, { cleared: true });
   } catch (e) {
-    res.status(500).json({ error: String(e.message || e) });
+    return fail(res, 500, e);
   }
 });
 
-// ---------- Arranque ----------
-app.listen(PORT, () => {
-  log.info(`Baileys microservice running on ${PORT}`);
+// ---------- Start ----------
+app.listen(PORT, async () => {
+  await ensureDir(AUTH_DIR);
+  logger.info(`Baileys microservice running on ${PORT}`);
 });
