@@ -1,29 +1,90 @@
-import makeWASocket, { useMultiFileAuthState, makeCacheableSignalKeyStore } from "@whiskeysockets/baileys";
-import MAIN_LOGGER from "@whiskeysockets/baileys/lib/Utils/logger.js";
+// baileys.js — ESM, robusto para v6.6.0
+import * as baileys from "@whiskeysockets/baileys";
+import pino from "pino";
 import { Boom } from "@hapi/boom";
+import fs from "fs";
+
+const {
+  default: _makeWASocket,
+  useMultiFileAuthState,
+  makeCacheableSignalKeyStore,
+  DisconnectReason,
+  fetchLatestBaileysVersion,
+} = baileys;
+
+// normaliza el default (ESM/CJS)
+const makeWASocket =
+  typeof _makeWASocket === "function"
+    ? _makeWASocket
+    : _makeWASocket?.default ?? _makeWASocket;
 
 export async function startBaileys(onQr, onSock, authPath = "./auth") {
   const { state, saveCreds } = await useMultiFileAuthState(authPath);
-  const logger = MAIN_LOGGER.child({});
+  const { version } = await fetchLatestBaileysVersion();
+
+  const logger = pino({ level: process.env.BAILEYS_LOG_LEVEL || "warn" });
 
   const sock = makeWASocket({
+    version,
     printQRInTerminal: false,
-    auth: { creds: state.creds, keys: makeCacheableSignalKeyStore(state.keys, logger) },
-    browser: ["Railway", "Chrome", "121.0"]
+    auth: {
+      creds: state.creds,
+      keys: makeCacheableSignalKeyStore(state.keys, logger),
+    },
+    browser: ["Railway", "Chrome", "124.0"],
+    logger,
+    syncFullHistory: false,
+    generateHighQualityLinkPreview: true,
   });
 
-  onSock && onSock(sock);
+  // guardar credenciales
   sock.ev.on("creds.update", saveCreds);
 
+  // conexión / QR / reconexión
   sock.ev.on("connection.update", async ({ connection, lastDisconnect, qr }) => {
-    if (qr && onQr) onQr(qr);
-    if (connection === "open") console.log("WhatsApp connection opened ✅");
+    if (qr && onQr) {
+      try { onQr(qr); } catch (e) { console.error("[onQr error]", e); }
+    }
+
+    if (connection === "open") {
+      console.log("WhatsApp connection opened ✅");
+      try { onSock && onSock(sock); } catch (e) { console.error("[onSock error]", e); }
+    }
+
     if (connection === "close") {
-      const code = (lastDisconnect?.error instanceof Boom) ? lastDisconnect.error.output.statusCode : 0;
-      console.log("Connection closed ❌ code:", code);
-      if (code != 401) await startBaileys(onQr, onSock, authPath);
+      let code = 0;
+      if (lastDisconnect?.error instanceof Boom) {
+        code = lastDisconnect.error.output?.statusCode ?? 0;
+      } else {
+        code = lastDisconnect?.error?.output?.statusCode
+          ?? lastDisconnect?.error?.statusCode
+          ?? 0;
+      }
+
+      const loggedOut = code === DisconnectReason.loggedOut || code === 401;
+      console.warn("Connection closed ❌ code:", code, loggedOut ? "(logged out)" : "");
+
+      if (loggedOut) {
+        // borra credenciales para forzar QR limpio en siguiente arranque
+        try { fs.rmSync(authPath, { recursive: true, force: true }); } catch {}
+        console.warn("[baileys] Logged out → removed authPath. No auto-reconnect.");
+        return;
+      }
+
+      setTimeout(() => {
+        console.warn("[baileys] Reconnecting...");
+        startBaileys(onQr, onSock, authPath).catch((e) =>
+          console.error("[baileys] Reconnect error:", e)
+        );
+      }, 2000);
     }
   });
+
+  // logs útiles (opcionales)
+  sock.ev.on("chats.set", ({ chats }) => console.log("[chats.set]", chats?.length || 0));
+  sock.ev.on("messages.upsert", ({ messages, type }) =>
+    console.log("[messages.upsert]", type, messages?.length || 0)
+  );
 
   return sock;
 }
