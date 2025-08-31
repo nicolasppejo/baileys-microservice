@@ -1,4 +1,10 @@
-import "./polyfills.js";            // 👈 debe ir primero
+// server.js (ESM) — incluye polyfill WebCrypto, SSE y QR robusto
+
+// === Polyfill WebCrypto (necesario para Baileys en algunos runtimes) ===
+import { webcrypto } from "crypto";
+if (!globalThis.crypto) globalThis.crypto = webcrypto;
+
+// === Imports base ===
 import express from "express";
 import bodyParser from "body-parser";
 import cors from "cors";
@@ -9,15 +15,15 @@ import { fileURLToPath } from "url";
 import { startBaileys } from "./baileys.js";
 import { jidNormalizedUser } from "@whiskeysockets/baileys";
 
-// ===== utils de ruta para ESM =====
+// === Utils ruta (ESM) ===
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
-// ===== app base =====
+// === App ===
 const app = express();
 app.use(bodyParser.json());
 
-// ===== CORS =====
+// === CORS ===
 const ALLOWED_ORIGIN = process.env.ALLOWED_ORIGIN || "*";
 app.use(
   cors({
@@ -27,7 +33,7 @@ app.use(
   })
 );
 
-// ===== API KEY middleware (sólo POST/DELETE) =====
+// === API KEY (solo POST/DELETE) ===
 const API_KEY = process.env.API_KEY || "";
 app.use((req, res, next) => {
   if (req.method === "POST" || req.method === "DELETE") {
@@ -38,7 +44,7 @@ app.use((req, res, next) => {
   next();
 });
 
-// ===== STATE =====
+// === STATE ===
 /**
  * sessions: Map<sessionId, {
  *   sock,
@@ -52,21 +58,19 @@ app.use((req, res, next) => {
  */
 const sessions = new Map();
 
-function authDir(sessionId) {
-  return path.join(__dirname, "auth", sessionId);
-}
-function ensureSession(sessionId) {
-  const s = sessions.get(sessionId);
+const authDir = (id) => path.join(__dirname, "auth", id);
+const ensureSession = (id) => {
+  const s = sessions.get(id);
   if (!s) throw new Error("Session not found");
   return s;
-}
+};
 
-// ===== push eventos a webhook + SSE =====
+// === Push a webhook + SSE ===
 async function pushEvent(sessionId, type, payload) {
   const s = sessions.get(sessionId);
   if (!s) return;
 
-  // A) Webhook (opcional)
+  // A) Webhook opcional
   if (s.webhookUrl) {
     try {
       await fetch(s.webhookUrl, {
@@ -88,10 +92,10 @@ async function pushEvent(sessionId, type, payload) {
   }
 }
 
-// ===== HEALTH =====
+// === HEALTH ===
 app.get("/", (_, res) => res.json({ ok: true, service: "baileys-microservice" }));
 
-// ===== CREATE SESSION (QR) =====
+// === CREATE SESSION (QR) ===
 app.post("/sessions", async (req, res) => {
   try {
     const { sessionId } = req.body || {};
@@ -112,17 +116,16 @@ app.post("/sessions", async (req, res) => {
 
     const sock = await startBaileys(
       async (qr) => {
-        // guarda texto + genera DataURL en background
-        state.lastQrText = qr;
-        QRCode.toDataURL(qr)
+        state.lastQrText = qr; // guarda texto crudo
+        QRCode.toDataURL(qr)   // genera DataURL en background
           .then((url) => { state.lastQrDataUrl = url; })
           .catch(() => {});
-        pushEvent(sessionId, "qr", { png: true });
+        pushEvent(sessionId, "qr", { png: true }); // notif stream
       },
       (s) => {
         state.sock = s;
 
-        // Eventos para cache local + SSE
+        // ---- Listeners para cache + SSE ----
         s.ev.on("chats.set", ({ chats }) => {
           for (const c of chats) state.chats.set(c.id, c);
           pushEvent(sessionId, "chats.set", { count: chats.length });
@@ -167,25 +170,24 @@ app.post("/sessions", async (req, res) => {
     );
 
     state.sock = sock;
-    return res.json({ ok: true, sessionId });
+    res.json({ ok: true, sessionId });
   } catch (e) {
-    return res.status(500).json({ error: String(e?.message || e) });
+    res.status(500).json({ error: String(e?.message || e) });
   }
 });
 
-// ===== STATUS =====
+// === STATUS ===
 app.get("/sessions/:id/status", (req, res) => {
   const s = sessions.get(req.params.id);
   if (!s) return res.json({ connected: false });
   const connected = !!(s.sock && s.sock.user);
-  return res.json({ connected, me: s.sock?.user || null });
+  res.json({ connected, me: s.sock?.user || null });
 });
 
-// ===== QR PNG (robusto) =====
+// === QR PNG (robusto) ===
 app.get("/sessions/:id/qr.png", async (req, res) => {
   const s = sessions.get(req.params.id);
   if (!s || (!s.lastQrDataUrl && !s.lastQrText)) return res.status(404).send("QR not ready");
-
   try {
     if (s.lastQrDataUrl) {
       const base64 = s.lastQrDataUrl.split(",")[1];
@@ -195,12 +197,12 @@ app.get("/sessions/:id/qr.png", async (req, res) => {
       res.setHeader("Content-Type", "image/png");
       return QRCode.toFileStream(res, s.lastQrText, { type: "png", margin: 1, scale: 6 });
     }
-  } catch (e) {
+  } catch {
     return res.status(500).send("QR render error");
   }
 });
 
-// ===== SEND MESSAGE =====
+// === SEND MESSAGE ===
 app.post("/sessions/:id/send", async (req, res) => {
   try {
     const s = ensureSession(req.params.id);
@@ -216,7 +218,6 @@ app.post("/sessions/:id/send", async (req, res) => {
     try { await s.sock.presenceSubscribe?.(jid); } catch (_) {}
     const r = await s.sock.sendMessage(jid, { text });
 
-    // cache local
     const msgId = r?.key?.id || null;
     if (msgId) {
       const arr = s.messages.get(jid) || [];
@@ -230,13 +231,13 @@ app.post("/sessions/:id/send", async (req, res) => {
     }
 
     pushEvent(req.params.id, "messages.sent", { to: jid, id: msgId });
-    return res.json({ ok: true, id: msgId });
+    res.json({ ok: true, id: msgId });
   } catch (e) {
-    return res.status(500).json({ error: String(e?.message || e) });
+    res.status(500).json({ error: String(e?.message || e) });
   }
 });
 
-// ===== CHATS LIST =====
+// === CHATS LIST ===
 app.get("/sessions/:id/chats", (req, res) => {
   const s = sessions.get(req.params.id);
   if (!s) return res.status(400).json({ error: "Session not found" });
@@ -248,7 +249,7 @@ app.get("/sessions/:id/chats", (req, res) => {
   res.json({ ok: true, chats: list.slice(0, limit) });
 });
 
-// ===== MESSAGES LIST (con paginación simple) =====
+// === MESSAGES LIST (paginación simple) ===
 app.get("/sessions/:id/messages", async (req, res) => {
   try {
     const s = ensureSession(req.params.id);
@@ -281,7 +282,7 @@ app.get("/sessions/:id/messages", async (req, res) => {
   }
 });
 
-// ===== SSE (stream en vivo) =====
+// === SSE (stream en vivo) ===
 app.get("/sessions/:id/stream", (req, res) => {
   const s = sessions.get(req.params.id);
   if (!s) return res.status(400).json({ error: "Session not found" });
@@ -294,7 +295,7 @@ app.get("/sessions/:id/stream", (req, res) => {
   s.sseClients.add(res);
   res.write(`event: ready\ndata: ${JSON.stringify({ ts: Date.now() })}\n\n`);
 
-  // keep-alive
+  // keep-alive para proxies
   const ping = setInterval(() => {
     try { res.write(`event: ping\ndata: {}\n\n`); } catch (_) {}
   }, 25000);
@@ -305,33 +306,30 @@ app.get("/sessions/:id/stream", (req, res) => {
   });
 });
 
-// ===== Webhook (guardar URL) — opcional =====
+// === Webhook (guardar URL) — opcional ===
 app.post("/sessions/:id/webhook", (req, res) => {
   const s = sessions.get(req.params.id);
   if (!s) return res.status(400).json({ error: "Session not found" });
   const { url } = req.body || {};
   if (!url) return res.status(400).json({ error: "Missing url" });
   s.webhookUrl = url;
-  return res.json({ ok: true });
+  res.json({ ok: true });
 });
 
-// ===== DELETE SESSION =====
+// === DELETE SESSION ===
 app.delete("/sessions/:id", (req, res) => {
   const id = req.params.id;
   const s = sessions.get(id);
   if (s) {
     for (const r of s.sseClients) {
-      try {
-        r.write(`event: close\ndata: {}\n\n`);
-        r.end();
-      } catch (_) {}
+      try { r.write(`event: close\ndata: {}\n\n`); r.end(); } catch (_) {}
     }
   }
   sessions.delete(id);
   try { fs.rmSync(authDir(id), { recursive: true, force: true }); } catch {}
-  return res.json({ ok: true });
+  res.json({ ok: true });
 });
 
-// ===== START SERVER =====
+// === START SERVER ===
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log("Baileys microservice running on", PORT));
