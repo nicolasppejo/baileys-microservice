@@ -22,7 +22,7 @@ app.use(cors({
 app.use((req,res,next)=>{
   if(req.method=="POST"||req.method=="DELETE"){
     const key=req.headers["x-api-key"];
-    if(!API_KEY or key==API_KEY) return next();
+    if(!API_KEY || key==API_KEY) return next();
     return res.status(401).json({error:"Invalid API key"});
   }
   next();
