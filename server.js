@@ -1,4 +1,5 @@
 // server.js (ESM)
+
 import express from "express";
 import cors from "cors";
 import pino from "pino";
@@ -7,13 +8,16 @@ import { fileURLToPath } from "node:url";
 import fs from "node:fs/promises";
 import QRCode from "qrcode";
 
-import {
-  makeWASocket,
+// 👇 Baileys: separa el Store del resto para evitar el error
+import { makeInMemoryStore } from "@whiskeysockets/baileys/lib/Store.js";
+import makeWASocket, {
   useMultiFileAuthState,
   fetchLatestBaileysVersion,
-  makeInMemoryStore,
-  DisconnectReason
+  DisconnectReason,
+  jidDecode,
+  Browsers,
 } from "@whiskeysockets/baileys";
+
 
 // ---------- Config ----------
 
