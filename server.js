@@ -1,342 +1,318 @@
+// server.js — Baileys Microservice (Railway)
+// Listo para producción básica con SSE en vivo.
+
 import express from "express";
-import bodyParser from "body-parser";
 import cors from "cors";
-import fs from "fs";
-import path from "path";
 import QRCode from "qrcode";
-import { startBaileys } from "./baileys.js";
-import { jidNormalizedUser } from "@whiskeysockets/baileys";
+import { EventEmitter } from "events";
+import pino from "pino";
+import pretty from "pino-pretty";
+import {
+  makeWASocket,
+  useMultiFileAuthState,
+  fetchLatestBaileysVersion,
+  makeInMemoryStore,
+  jidNormalizedUser,
+  DisconnectReason,
+  proto
+} from "@adiwajshing/baileys";
 
+const log = pino(pretty({ translateTime: "SYS:mm-dd HH:MM:ss" }));
 const app = express();
-app.use(bodyParser.json());
+app.set("trust proxy", 1);
 
-// ====== ENV ======
+// ====== CONFIG ======
+const API_KEY = process.env.API_KEY || "dev-key";
 const ALLOWED_ORIGIN = process.env.ALLOWED_ORIGIN || "*";
-const API_KEY = process.env.API_KEY || "";
+const PORT = Number(process.env.PORT || 3000);
 
-// ====== CORS ======
-app.use(
-  cors({
-    origin: ALLOWED_ORIGIN,
-    methods: ["GET", "POST", "DELETE"],
-    allowedHeaders: ["Content-Type", "x-api-key"],
-  })
-);
+// ====== MIDDLEWARE ======
+app.use(cors({
+  origin: (origin, cb) => cb(null, ALLOWED_ORIGIN === "*" ? true : origin === ALLOWED_ORIGIN),
+  credentials: true
+}));
+app.use(express.json());
 
-// ====== API KEY middleware (solo POST/DELETE necesitan llave) ======
-app.use((req, res, next) => {
-  if (req.method === "POST" || req.method === "DELETE") {
-    const key = req.headers["x-api-key"];
-    if (!API_KEY || key === API_KEY) return next();
-    return res.status(401).json({ error: "Invalid API key" });
-  }
+// API-key guard excepto /stream y /qr.png (para iframes/imagenes)
+const guard = (req, res, next) => {
+  const ok = req.headers["x-api-key"] === API_KEY;
+  if (!ok) return res.status(401).json({ error: "Unauthorized" });
   next();
+};
+
+// ====== SESIONES EN MEMORIA ======
+// sockRefs: { [sessionId]: { sock, store, ev } }
+const sessions = new Map();
+// broadcaster SSE por sesión
+// sseMap: { [sessionId]: EventEmitter }
+const sseMap = new Map();
+
+// util broadcast SSE
+const broadcast = (sessionId, event, payload) => {
+  const ev = sseMap.get(sessionId);
+  if (!ev) return;
+  ev.emit("sse", { event, payload, ts: Date.now() });
+};
+
+// ====== HELPERS ======
+const ensureSession = (sessionId) => sessions.get(sessionId);
+const validJid = (to) => /@s\.whatsapp\.net$|@g\.us$/.test(to);
+
+// ====== BAILEYS START/STOP ======
+async function startSession(sessionId) {
+  // si ya existe, devuelve
+  if (sessions.get(sessionId)?.sock?.ev) return sessions.get(sessionId);
+
+  const { state, saveCreds } = await useMultiFileAuthState(`./auth/${sessionId}`);
+  const { version } = await fetchLatestBaileysVersion();
+
+  const store = makeInMemoryStore({ logger: log });
+  store.readFromFile(`./auth/${sessionId}/store.json`);
+  setInterval(() => {
+    try {
+      store.writeToFile(`./auth/${sessionId}/store.json`);
+    } catch {}
+  }, 30_000);
+
+  const sock = makeWASocket({
+    version,
+    auth: state,
+    printQRInTerminal: false,
+    browser: ["Veroz", "Chrome", "121.0"],
+    markOnlineOnConnect: false,
+    logger: log
+  });
+
+  // Bind store
+  store.bind(sock.ev);
+
+  // Eventos → SSE
+  sock.ev.on("chats.upsert", (payload) => {
+    broadcast(sessionId, "chats.upsert", payload);
+  });
+  sock.ev.on("chats.update", (payload) => {
+    broadcast(sessionId, "chats.update", payload);
+  });
+  sock.ev.on("messages.upsert", (payload) => {
+    broadcast(sessionId, "messages.upsert", payload);
+  });
+  sock.ev.on("creds.update", async () => {
+    await saveCreds();
+    broadcast(sessionId, "creds.update", {});
+  });
+
+  // Connection updates
+  sock.ev.on("connection.update", (update) => {
+    const { connection, lastDisconnect, qr } = update;
+    if (qr) {
+      // Guarda QR para servir PNG
+      sock.__lastQr = qr;
+      broadcast(sessionId, "qr.update", { ts: Date.now() });
+    }
+
+    if (connection === "close") {
+      const code = lastDisconnect?.error?.output?.statusCode;
+      const reason = lastDisconnect?.error?.message || "";
+      log.warn(`[${sessionId}] connection closed → ${code} ${reason}`);
+      // Intento de reconnect salvo logout explícito
+      if (code !== DisconnectReason.loggedOut) {
+        setTimeout(() => startSession(sessionId).catch(() => {}), 1000);
+      }
+    } else if (connection === "open") {
+      log.info(`[${sessionId}] WhatsApp connected ✔️`);
+      broadcast(sessionId, "status", { connected: true });
+    }
+  });
+
+  const ref = { sock, store };
+  sessions.set(sessionId, ref);
+  return ref;
+}
+
+// ====== ENDPOINTS ======
+
+// Ping
+app.get("/", (_req, res) => {
+  res.json({ ok: true, service: "baileys-microservice" });
 });
 
-// ====== STATE ======
-/**
- * sessions: Map<sessionId, {
- *   sock,
- *   lastQrDataUrl,
- *   webhookUrl,
- *   chats: Map<jid, chat>,
- *   messages: Map<jid, Message[]>,
- *   sseClients: Set<ServerResponse>
- * }>
- */
-const sessions = new Map();
-
-function authDir(sessionId) {
-  return path.join("./auth", sessionId);
-}
-
-function ensureSession(sessionId) {
-  const s = sessions.get(sessionId);
-  if (!s) throw new Error("Session not found");
-  return s;
-}
-
-// Enviar evento a webhook + SSE
-async function pushEvent(sessionId, type, payload) {
-  const s = sessions.get(sessionId);
-  if (!s) return;
-
-  // A) Webhook (opcional)
-  if (s.webhookUrl) {
-    try {
-      await fetch(s.webhookUrl, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          sessionId,
-          type,
-          payload,
-          ts: Date.now(),
-        }),
-      });
-    } catch (_) {}
-  }
-
-  // B) SSE (en vivo al navegador)
-  if (s.sseClients.size) {
-    const frame = `event: ${type}\ndata: ${JSON.stringify({
-      sessionId,
-      payload,
-      ts: Date.now(),
-    })}\n\n`;
-    for (const res of s.sseClients) {
-      try {
-        res.write(frame);
-      } catch (_) {}
-    }
-  }
-}
-
-// ====== HEALTH ======
-app.get("/", (_, res) =>
-  res.json({ ok: true, service: "baileys-microservice" })
-);
-
-// ====== CREATE SESSION (QR) ======
-app.post("/sessions", async (req, res) => {
+// Crear/(re)cargar sesión
+app.post("/sessions", guard, async (req, res) => {
   try {
-    const { sessionId } = req.body || {};
+    const sessionId = String(req.body?.sessionId || "").trim();
     if (!sessionId) return res.status(400).json({ error: "Missing sessionId" });
 
-    // prepara carpeta y estado
-    fs.mkdirSync(authDir(sessionId), { recursive: true });
+    await startSession(sessionId);
+    // crea channel SSE si no existe
+    if (!sseMap.get(sessionId)) sseMap.set(sessionId, new EventEmitter());
 
-    const state = {
-      sock: null,
-      lastQrDataUrl: null,
-      webhookUrl: null,
-      chats: new Map(),
-      messages: new Map(),
-      sseClients: new Set(),
-    };
-    sessions.set(sessionId, state);
-
-    // arranca Baileys
-    const sock = await startBaileys(
-      async (qr) => {
-        state.lastQrDataUrl = await QRCode.toDataURL(qr);
-        pushEvent(sessionId, "qr", { png: true });
-      },
-      (s) => {
-        state.sock = s;
-
-        // --- Eventos de Baileys para historial y vivo ---
-        s.ev.on("chats.set", ({ chats }) => {
-          for (const c of chats) state.chats.set(c.id, c);
-          pushEvent(sessionId, "chats.set", { count: chats.length });
-        });
-
-        s.ev.on("chats.upsert", (chats) => {
-          for (const c of chats) state.chats.set(c.id, c);
-          pushEvent(sessionId, "chats.upsert", { count: chats.length });
-        });
-
-        s.ev.on("chats.update", (updates) => {
-          for (const u of updates) {
-            const prev = state.chats.get(u.id) || {};
-            state.chats.set(u.id, { ...prev, ...u });
-          }
-          pushEvent(sessionId, "chats.update", { count: updates.length });
-        });
-
-        s.ev.on("messages.upsert", ({ messages, type }) => {
-          for (const m of messages) {
-            const jid = m.key.remoteJid;
-            if (!jid) continue;
-            const arr = state.messages.get(jid) || [];
-            arr.unshift(m); // más nuevos primero
-            if (arr.length > 300) arr.pop(); // corta memoria
-            state.messages.set(jid, arr);
-          }
-          pushEvent(sessionId, "messages.upsert", {
-            type,
-            count: messages.length,
-          });
-        });
-
-        s.ev.on("messages.update", (updates) => {
-          pushEvent(sessionId, "messages.update", { count: updates.length });
-        });
-
-        s.ev.on("creds.update", () => {
-          pushEvent(sessionId, "creds.update", {});
-        });
-
-        s.ev.on("connection.update", ({ connection }) => {
-          pushEvent(sessionId, "connection.update", { connection });
-        });
-      },
-      authDir(sessionId)
-    );
-
-    state.sock = sock;
-    return res.json({ ok: true, sessionId });
+    res.json({ ok: true, sessionId });
   } catch (e) {
-    return res.status(500).json({ error: String(e?.message || e) });
+    log.error(e);
+    res.status(500).json({ error: String(e?.message || e) });
   }
 });
 
-// ====== STATUS ======
-app.get("/sessions/:id/status", (req, res) => {
-  const s = sessions.get(req.params.id);
-  if (!s) return res.json({ connected: false });
-  const connected = !!(s.sock && s.sock.user);
-  return res.json({ connected, me: s.sock?.user || null });
+// Estado de la sesión
+app.get("/sessions/:id/status", guard, (req, res) => {
+  const { id } = req.params;
+  const ref = ensureSession(id);
+  if (!ref?.sock) return res.json({ connected: false, me: null });
+  res.json({ connected: ref.sock?.user ? true : false, me: ref.sock?.user || null });
 });
 
-// ====== QR PNG ======
-app.get("/sessions/:id/qr.png", (req, res) => {
-  const s = sessions.get(req.params.id);
-  if (!s || !s.lastQrDataUrl) return res.status(404).send("QR not ready");
-  const base64 = s.lastQrDataUrl.split(",")[1];
-  res.setHeader("Content-Type", "image/png");
-  res.send(Buffer.from(base64, "base64"));
-});
-
-// ====== SEND MESSAGE ======
-app.post("/sessions/:id/send", async (req, res) => {
+// QR en PNG
+app.get("/sessions/:id/qr.png", async (req, res) => {
   try {
-    const s = ensureSession(req.params.id);
-    if (!s.sock) return res.status(400).json({ error: "Session not found" });
-    if (!s.sock.user) return res.status(400).json({ error: "Not connected" });
-
-    let { to, text } = req.body || {};
-    if (!to || !text)
-      return res.status(400).json({ error: "Missing 'to' or 'text'" });
-
-    if (!to.includes("@")) to = `${to}@s.whatsapp.net`;
-    const jid = jidNormalizedUser(to);
-
-    // opcional: presencia antes de enviar
-    try { await s.sock.presenceSubscribe?.(jid); } catch (_) {}
-    const r = await s.sock.sendMessage(jid, { text });
-
-    // actualiza cache local
-    const msgId = r?.key?.id || null;
-    if (msgId) {
-      const arr = s.messages.get(jid) || [];
-      arr.unshift({
-        key: r.key,
-        message: { conversation: text },
-        messageTimestamp: Math.floor(Date.now() / 1000),
-      });
-      if (arr.length > 300) arr.pop();
-      s.messages.set(jid, arr);
-    }
-
-    pushEvent(req.params.id, "messages.sent", { to: jid, id: msgId });
-    return res.json({ ok: true, id: msgId });
+    const { id } = req.params;
+    const ref = ensureSession(id);
+    if (!ref?.sock) return res.status(404).send("Session not found");
+    const qr = ref.sock.__lastQr;
+    if (!qr) return res.status(404).send("QR not ready");
+    res.setHeader("Content-Type", "image/png");
+    res.setHeader("Cache-Control", "no-cache, no-store");
+    const png = await QRCode.toBuffer(qr, { margin: 1, width: 360 });
+    res.end(png);
   } catch (e) {
-    return res.status(500).json({ error: String(e?.message || e) });
+    res.status(500).send("QR error");
   }
 });
 
-// ====== CHATS LIST ======
-app.get("/sessions/:id/chats", (req, res) => {
-  const s = sessions.get(req.params.id);
-  if (!s) return res.status(400).json({ error: "Session not found" });
-
-  const list = Array.from(s.chats.values()).sort(
-    (a, b) =>
-      (b?.conversationTimestamp || 0) - (a?.conversationTimestamp || 0)
-  );
-
-  // limit simple
-  const limit = Number(req.query.limit || 200);
-  res.json({ ok: true, chats: list.slice(0, limit) });
-});
-
-// ====== MESSAGES LIST (con paginación simple) ======
-app.get("/sessions/:id/messages", async (req, res) => {
+// Listar chats (por defecto usa store; con force=1 refresca desde WA)
+app.get("/sessions/:id/chats", guard, async (req, res) => {
   try {
-    const s = ensureSession(req.params.id);
-    const jid = req.query.jid;
-    if (!jid) return res.status(400).json({ error: "Missing jid" });
+    const { id } = req.params;
+    const limit = Math.min(Number(req.query.limit || 200), 1000);
+    const force = String(req.query.force || "0") === "1";
 
-    const limit = Number(req.query.limit || 50);
-    const cursor = req.query.cursor ? String(req.query.cursor) : null;
+    const ref = ensureSession(id);
+    if (!ref?.sock) return res.status(404).json({ error: "Session not found" });
 
-    let items = s.messages.get(jid) || [];
-
-    // si no hay suficientes, intenta traer más antiguos de WhatsApp
-    if (items.length < limit && s.sock) {
-      try {
-        const cursorKey = cursor
-          ? { id: cursor, fromMe: false, remoteJid: jid }
-          : undefined;
-        const more = await s.sock.loadMessages(jid, limit, cursorKey);
-        const map = new Map();
-        for (const m of [...more, ...items]) map.set(m.key.id, m);
-        items = Array.from(map.values()).sort(
-          (a, b) =>
-            (b.messageTimestamp || 0) - (a.messageTimestamp || 0)
-        );
-        s.messages.set(jid, items.slice(0, 600)); // cachea un poco más
-      } catch (_) {}
+    let chats = [];
+    if (force) {
+      // “forzar” contacto; no hay API oficial para “getAll”, así que
+      // devuelve lo que haya en store y lo enriquece con mensajes recientes
+      chats = ref.store?.chats?.all?.() || [];
+    } else {
+      chats = ref.store?.chats?.all?.() || [];
     }
 
-    const page = items.slice(0, limit);
-    const nextCursor = page.length ? page[page.length - 1].key.id : null;
-    res.json({ ok: true, messages: page, nextCursor });
+    // ordénalos por lastMessageTimestamp si existe
+    chats.sort((a, b) => (Number(b?.lastMessageRecvTimestamp || 0) - Number(a?.lastMessageRecvTimestamp || 0)));
+
+    res.json({ ok: true, chats: chats.slice(0, limit) });
   } catch (e) {
     res.status(500).json({ error: String(e?.message || e) });
   }
 });
 
-// ====== SSE (stream en vivo) ======
-app.get("/sessions/:id/stream", (req, res) => {
-  const s = sessions.get(req.params.id);
-  if (!s) return res.status(400).json({ error: "Session not found" });
+// Listar mensajes de un chat (usa loadMessages si no están en store)
+app.get("/sessions/:id/messages", guard, async (req, res) => {
+  try {
+    const { id } = req.params;
+    let { jid, limit } = req.query;
+    limit = Math.min(Number(limit || 50), 200);
 
-  res.setHeader("Content-Type", "text/event-stream");
-  res.setHeader("Cache-Control", "no-cache");
+    const ref = ensureSession(id);
+    if (!ref?.sock) return res.status(404).json({ error: "Session not found" });
+    if (!jid) return res.status(400).json({ error: "Missing jid" });
+
+    const j = decodeURIComponent(String(jid));
+    // preferimos store si existe
+    let msgs = [];
+    try {
+      msgs = ref.store?.messages?.[j]?.array?.() || [];
+    } catch {}
+
+    if (!msgs?.length) {
+      const resLoad = await ref.sock.loadMessages(j, limit);
+      msgs = resLoad || [];
+    }
+
+    // normaliza output
+    const out = msgs.map(m => ({
+      id: m?.key?.id,
+      fromMe: m?.key?.fromMe,
+      pushName: m?.pushName,
+      messageTimestamp: Number(m?.messageTimestamp) || 0,
+      message: m?.message
+    }));
+
+    out.sort((a, b) => a.messageTimestamp - b.messageTimestamp);
+    res.json({ ok: true, messages: out.slice(-Number(limit)) });
+  } catch (e) {
+    res.status(500).json({ error: String(e?.message || e) });
+  }
+});
+
+// Enviar mensaje
+app.post("/sessions/:id/send", guard, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { to, text } = req.body || {};
+    const ref = ensureSession(id);
+    if (!ref?.sock) return res.status(404).json({ error: "Session not found" });
+    if (!to || !text) return res.status(400).json({ error: "Missing 'to' or 'text'" });
+
+    // Normaliza JID individual si te pasan sólo el E164
+    let jid = String(to).trim();
+    if (!/@s\.whatsapp\.net$|@g\.us$/.test(jid)) {
+      // asume número
+      const num = jid.replace(/\D+/g, "");
+      jid = `${num}@s.whatsapp.net`;
+    }
+    if (!validJid(jid)) return res.status(400).json({ error: "Invalid jid" });
+
+    const r = await ref.sock.sendMessage(jid, { text: String(text) });
+    return res.json({ ok: true, id: r?.key?.id || null });
+  } catch (e) {
+    log.error("send error:", e?.message || e);
+    res.status(500).json({ error: String(e?.message || e) });
+  }
+});
+
+// SSE — stream en vivo (sin API key para facilitar desde webapps)
+app.get("/sessions/:id/stream", async (req, res) => {
+  const { id } = req.params;
+
+  // crea si no existe
+  if (!ensureSession(id)) {
+    try { await startSession(id); } catch {}
+  }
+  if (!sseMap.get(id)) sseMap.set(id, new EventEmitter());
+
+  // headers anti-buffering
+  res.setHeader("Content-Type", "text/event-stream; charset=utf-8");
+  res.setHeader("Cache-Control", "no-cache, no-transform");
   res.setHeader("Connection", "keep-alive");
+  res.setHeader("X-Accel-Buffering", "no");
   res.flushHeaders?.();
 
-  s.sseClients.add(res);
-  res.write(`event: ready\ndata: ${JSON.stringify({ ts: Date.now() })}\n\n`);
+  // helper
+  const send = (event, data) => {
+    res.write(`event: ${event}\n`);
+    res.write(`data: ${JSON.stringify(data)}\n\n`);
+  };
+
+  // primer evento rompe buffers
+  send("ready", { ts: Date.now() });
+
+  // heartbeat
+  const hb = setInterval(() => send("ping", { ts: Date.now() }), 15000);
+
+  const emitter = sseMap.get(id);
+  const onSse = ({ event, payload, ts }) => send(event, { sessionId: id, payload, ts });
+
+  emitter.on("sse", onSse);
 
   req.on("close", () => {
-    s.sseClients.delete(res);
+    clearInterval(hb);
+    emitter.off("sse", onSse);
+    res.end();
   });
 });
 
-// ====== Webhook (guardar URL) — opcional ======
-app.post("/sessions/:id/webhook", (req, res) => {
-  const s = sessions.get(req.params.id);
-  if (!s) return res.status(400).json({ error: "Session not found" });
-  const { url } = req.body || {};
-  if (!url) return res.status(400).json({ error: "Missing url" });
-  s.webhookUrl = url;
-  return res.json({ ok: true });
+// ====== START ======
+app.listen(PORT, () => {
+  log.info(`Baileys microservice running on ${PORT}`);
 });
-
-// ====== DELETE SESSION ======
-app.delete("/sessions/:id", (req, res) => {
-  const id = req.params.id;
-  const s = sessions.get(id);
-  if (s) {
-    for (const res of s.sseClients) {
-      try {
-        res.write(`event: close\ndata: {}\n\n`);
-        res.end();
-      } catch (_) {}
-    }
-  }
-  sessions.delete(id);
-  try {
-    fs.rmSync(authDir(id), { recursive: true, force: true });
-  } catch {}
-  return res.json({ ok: true });
-});
-
-// ====== START SERVER ======
-const PORT = process.env.PORT || 3000;
-app.listen(PORT, () =>
-  console.log("Baileys microservice running on", PORT)
-);
