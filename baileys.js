@@ -12,13 +12,14 @@ const {
   fetchLatestBaileysVersion,
 } = baileys;
 
-// normaliza el default (ESM/CJS)
+// normaliza default para ESM/CJS
 const makeWASocket =
   typeof _makeWASocket === "function"
     ? _makeWASocket
     : _makeWASocket?.default ?? _makeWASocket;
 
 export async function startBaileys(onQr, onSock, authPath = "./auth") {
+  // carga/crea estado persistente
   const { state, saveCreds } = await useMultiFileAuthState(authPath);
   const { version } = await fetchLatestBaileysVersion();
 
@@ -37,11 +38,12 @@ export async function startBaileys(onQr, onSock, authPath = "./auth") {
     generateHighQualityLinkPreview: true,
   });
 
-  // guardar credenciales
+  // guarda credenciales cuando cambien
   sock.ev.on("creds.update", saveCreds);
 
   // conexión / QR / reconexión
   sock.ev.on("connection.update", async ({ connection, lastDisconnect, qr }) => {
+    // 🔑 ¡EMITIR QR!
     if (qr && onQr) {
       try { onQr(qr); } catch (e) { console.error("[onQr error]", e); }
     }
@@ -52,6 +54,7 @@ export async function startBaileys(onQr, onSock, authPath = "./auth") {
     }
 
     if (connection === "close") {
+      // determinar motivo
       let code = 0;
       if (lastDisconnect?.error instanceof Boom) {
         code = lastDisconnect.error.output?.statusCode ?? 0;
@@ -65,12 +68,13 @@ export async function startBaileys(onQr, onSock, authPath = "./auth") {
       console.warn("Connection closed ❌ code:", code, loggedOut ? "(logged out)" : "");
 
       if (loggedOut) {
-        // borra credenciales para forzar QR limpio en siguiente arranque
+        // limpia credenciales para forzar QR limpio en próximo arranque
         try { fs.rmSync(authPath, { recursive: true, force: true }); } catch {}
         console.warn("[baileys] Logged out → removed authPath. No auto-reconnect.");
         return;
       }
 
+      // reconexión para caídas transitorias
       setTimeout(() => {
         console.warn("[baileys] Reconnecting...");
         startBaileys(onQr, onSock, authPath).catch((e) =>
@@ -80,7 +84,7 @@ export async function startBaileys(onQr, onSock, authPath = "./auth") {
     }
   });
 
-  // logs útiles (opcionales)
+  // (opcionales) logs útiles
   sock.ev.on("chats.set", ({ chats }) => console.log("[chats.set]", chats?.length || 0));
   sock.ev.on("messages.upsert", ({ messages, type }) =>
     console.log("[messages.upsert]", type, messages?.length || 0)
