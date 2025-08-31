@@ -1,279 +1,372 @@
-// server.js — Baileys Microservice (Railway)
-// Versión sin "pino-pretty" para evitar crash por dependencia faltante.
-
+// server.js (ESM)
 import express from "express";
 import cors from "cors";
-import QRCode from "qrcode";
-import { EventEmitter } from "events";
 import pino from "pino";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
+import fs from "node:fs/promises";
+import QRCode from "qrcode";
+
 import {
   makeWASocket,
   useMultiFileAuthState,
   fetchLatestBaileysVersion,
   makeInMemoryStore,
   DisconnectReason
-} from "@adiwajshing/baileys";
+} from "@whiskeysockets/baileys";
 
-const log = pino({ level: process.env.LOG_LEVEL || "info" });
-const app = express();
-app.set("trust proxy", 1);
+// ---------- Config ----------
 
-// ====== CONFIG ======
-const API_KEY = process.env.API_KEY || "dev-key";
+const PORT = process.env.PORT || 3000;
+const API_KEY = process.env.API_KEY || "changeme";
 const ALLOWED_ORIGIN = process.env.ALLOWED_ORIGIN || "*";
-const PORT = Number(process.env.PORT || 3000);
 
-// ====== MIDDLEWARE ======
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+
+const log = pino({ level: "info" });
+const app = express();
+
+app.use(express.json());
 app.use(
   cors({
-    origin: (origin, cb) => cb(null, ALLOWED_ORIGIN === "*" ? true : origin === ALLOWED_ORIGIN),
-    credentials: true,
+    origin: ALLOWED_ORIGIN === "*" ? true : ALLOWED_ORIGIN,
+    credentials: false
   })
 );
-app.use(express.json());
 
-// API-key guard (dejamos /stream y /qr.png sin key para iframes/imagenes)
-const guard = (req, res, next) => {
-  const ok = req.headers["x-api-key"] === API_KEY;
-  if (!ok) return res.status(401).json({ error: "Unauthorized" });
+// API key guard
+app.use((req, res, next) => {
+  const key = req.header("x-api-key");
+  if (!API_KEY) return res.status(500).json({ error: "Missing API_KEY env" });
+  if (key !== API_KEY) return res.status(401).json({ error: "Unauthorized" });
   next();
-};
+});
 
-// ====== SESIONES ======
-const sessions = new Map(); // { sessionId: { sock, store } }
-const sseMap = new Map();   // { sessionId: EventEmitter }
+// ---------- Sesiones en memoria ----------
 
-const broadcast = (sessionId, event, payload) => {
-  const ev = sseMap.get(sessionId);
-  if (!ev) return;
-  ev.emit("sse", { event, payload, ts: Date.now() });
-};
+/**
+ * sessions: Map<sessionId, {
+ *   sock,
+ *   store,
+ *   state,
+ *   startPromise,
+ *   lastQr,                 // string (raw) del último QR
+ *   lastQrPng,              // Buffer PNG
+ *   connected: boolean,
+ *   sseClients: Set<res>,   // conexiones SSE de ese sessionId
+ * }>
+ */
+const sessions = new Map();
 
-const ensureSession = (sessionId) => sessions.get(sessionId);
-const validJid = (to) => /@s\.whatsapp\.net$|@g\.us$/.test(to);
-
-// ====== BAILEYS ======
-async function startSession(sessionId) {
-  if (sessions.get(sessionId)?.sock?.ev) return sessions.get(sessionId);
-
-  const { state, saveCreds } = await useMultiFileAuthState(`./auth/${sessionId}`);
-  const { version } = await fetchLatestBaileysVersion();
-
-  const store = makeInMemoryStore({ logger: log });
-  try {
-    store.readFromFile(`./auth/${sessionId}/store.json`);
-  } catch {}
-  setInterval(() => {
-    try {
-      store.writeToFile(`./auth/${sessionId}/store.json`);
-    } catch {}
-  }, 30_000);
-
-  const sock = makeWASocket({
-    version,
-    auth: state,
-    printQRInTerminal: false,
-    browser: ["Veroz", "Chrome", "121.0"],
-    markOnlineOnConnect: false,
-    logger: log,
-  });
-
-  store.bind(sock.ev);
-
-  // Eventos → SSE
-  sock.ev.on("chats.upsert", (payload) => broadcast(sessionId, "chats.upsert", payload));
-  sock.ev.on("chats.update", (payload) => broadcast(sessionId, "chats.update", payload));
-  sock.ev.on("messages.upsert", (payload) => broadcast(sessionId, "messages.upsert", payload));
-  sock.ev.on("creds.update", async () => {
-    await saveCreds();
-    broadcast(sessionId, "creds.update", {});
-  });
-
-  sock.ev.on("connection.update", (update) => {
-    const { connection, lastDisconnect, qr } = update;
-    if (qr) {
-      sock.__lastQr = qr;
-      broadcast(sessionId, "qr.update", { ts: Date.now() });
-    }
-    if (connection === "close") {
-      const code = lastDisconnect?.error?.output?.statusCode;
-      const reason = lastDisconnect?.error?.message || "";
-      log.warn({ sessionId, code, reason }, "connection closed");
-      if (code !== DisconnectReason.loggedOut) {
-        setTimeout(() => startSession(sessionId).catch(() => {}), 1000);
-      }
-    } else if (connection === "open") {
-      log.info({ sessionId }, "WhatsApp connected");
-      broadcast(sessionId, "status", { connected: true });
-    }
-  });
-
-  const ref = { sock, store };
-  sessions.set(sessionId, ref);
-  return ref;
+// util FS
+async function ensureDir(dir) {
+  await fs.mkdir(dir, { recursive: true });
 }
 
-// ====== ROUTES ======
-
-// Ping
-app.get("/", (_req, res) => res.json({ ok: true, service: "baileys-microservice" }));
-
-// Crear/(re)cargar sesión
-app.post("/sessions", guard, async (req, res) => {
+async function removeDir(dir) {
   try {
-    const sessionId = String(req.body?.sessionId || "").trim();
-    if (!sessionId) return res.status(400).json({ error: "Missing sessionId" });
-    await startSession(sessionId);
-    if (!sseMap.get(sessionId)) sseMap.set(sessionId, new EventEmitter());
+    await fs.rm(dir, { recursive: true, force: true });
+  } catch {}
+}
+
+// ---------- Helper: crear/iniciar sesión ----------
+
+async function startSession(sessionId) {
+  if (sessions.get(sessionId)?.sock) {
+    // ya existe y está iniciada
+    return sessions.get(sessionId);
+  }
+
+  // evita doble arranque
+  if (sessions.get(sessionId)?.startPromise) {
+    return sessions.get(sessionId).startPromise;
+  }
+
+  const startPromise = (async () => {
+    const authDir = path.join(__dirname, "auth", sessionId);
+    await ensureDir(authDir);
+
+    const { state, saveCreds } = await useMultiFileAuthState(authDir);
+    const store = makeInMemoryStore({ logger: log });
+
+    const { version } = await fetchLatestBaileysVersion();
+    log.info({ version }, "Using WA Web version");
+
+    const sock = makeWASocket({
+      printQRInTerminal: false,
+      auth: state,
+      version,
+      browser: ["Bolt", "Chrome", "121.0"],
+      logger: log
+    });
+
+    store.bind(sock.ev);
+
+    const sess = {
+      sock,
+      store,
+      state,
+      startPromise: null,
+      lastQr: null,
+      lastQrPng: null,
+      connected: false,
+      sseClients: new Set()
+    };
+
+    sessions.set(sessionId, sess);
+
+    // Eventos
+    sock.ev.on("creds.update", saveCreds);
+    sock.ev.on("connection.update", async (u) => {
+      const { connection, lastDisconnect, qr } = u;
+
+      if (qr) {
+        sess.lastQr = qr;
+        try {
+          sess.lastQrPng = await QRCode.toBuffer(qr, { width: 320 });
+        } catch (e) {
+          log.error({ err: e }, "QR png generation failed");
+          sess.lastQrPng = null;
+        }
+        pushSse(sessionId, "qr.update", { hasQr: true });
+      }
+
+      if (connection === "open") {
+        sess.connected = true;
+        log.info({ sessionId }, "WA connection opened");
+        pushSse(sessionId, "connection.update", { connected: true });
+      } else if (connection === "close") {
+        sess.connected = false;
+        const code = lastDisconnect?.error?.output?.statusCode;
+        log.warn({ sessionId, code }, "WA connection closed");
+        pushSse(sessionId, "connection.update", { connected: false });
+
+        // Reconnect si no es logout explícito
+        if (code && code !== DisconnectReason.loggedOut) {
+          log.info({ sessionId }, "Trying to reconnect...");
+          setTimeout(() => startSession(sessionId).catch(() => {}), 2000);
+        }
+      }
+    });
+
+    // Reenvía eventos de mensajes/chats a SSE
+    sock.ev.on("messages.upsert", (payload) => {
+      pushSse(sessionId, "messages.upsert", payload);
+    });
+    sock.ev.on("chats.upsert", (payload) => {
+      pushSse(sessionId, "chats.upsert", payload);
+    });
+    sock.ev.on("chats.update", (payload) => {
+      pushSse(sessionId, "chats.update", payload);
+    });
+    sock.ev.on("creds.update", () => {
+      pushSse(sessionId, "creds.update", {});
+    });
+
+    return sess;
+  })();
+
+  sessions.set(sessionId, { startPromise });
+  const sess = await startPromise;
+  return sess;
+}
+
+// ---------- SSE helper ----------
+
+function pushSse(sessionId, event, data) {
+  const sess = sessions.get(sessionId);
+  if (!sess?.sseClients?.size) return;
+  const payload = typeof data === "string" ? data : JSON.stringify({ sessionId, payload: data, ts: Date.now() });
+  for (const res of sess.sseClients) {
+    res.write(`event: ${event}\n`);
+    res.write(`data: ${payload}\n\n`);
+  }
+}
+
+// ---------- Rutas ----------
+
+// Salud
+app.get("/", (req, res) => {
+  res.json({ ok: true, service: "baileys-microservice" });
+});
+
+// Crear o (re)cargar sesión
+app.post("/sessions", async (req, res) => {
+  try {
+    const { sessionId } = req.body || {};
+    if (!sessionId) return res.status(400).json({ error: "Missing 'sessionId'" });
+
+    const sess = await startSession(sessionId);
     res.json({ ok: true, sessionId });
   } catch (e) {
-    log.error(e);
-    res.status(500).json({ error: String(e?.message || e) });
+    log.error({ err: e }, "create session error");
+    res.status(500).json({ error: String(e.message || e) });
   }
 });
 
 // Estado
-app.get("/sessions/:id/status", guard, (req, res) => {
-  const { id } = req.params;
-  const ref = ensureSession(id);
-  if (!ref?.sock) return res.json({ connected: false, me: null });
-  res.json({ connected: !!ref.sock.user, me: ref.sock.user || null });
+app.get("/sessions/:id/status", async (req, res) => {
+  try {
+    const { id } = req.params;
+    const sess = sessions.get(id);
+    if (!sess?.sock) return res.json({ ok: true, connected: false, me: null });
+
+    res.json({
+      ok: true,
+      connected: !!sess.connected,
+      me: sess.sock?.user || null
+    });
+  } catch (e) {
+    res.status(500).json({ error: String(e.message || e) });
+  }
 });
 
 // QR como PNG
 app.get("/sessions/:id/qr.png", async (req, res) => {
   try {
     const { id } = req.params;
-    const ref = ensureSession(id);
-    if (!ref?.sock) return res.status(404).send("Session not found");
-    const qr = ref.sock.__lastQr;
-    if (!qr) return res.status(404).send("QR not ready");
+    const sess = sessions.get(id);
+    if (!sess) return res.status(404).send("Session not found");
+
+    // Si no está arrancada, arráncala (para emitir QR)
+    if (!sess.sock) await startSession(id);
+
+    if (!sessions.get(id)?.lastQrPng) {
+      return res.status(404).send("QR not ready");
+    }
+
     res.setHeader("Content-Type", "image/png");
-    res.setHeader("Cache-Control", "no-cache, no-store");
-    const png = await QRCode.toBuffer(qr, { margin: 1, width: 360 });
-    res.end(png);
-  } catch {
+    res.send(sessions.get(id).lastQrPng);
+  } catch (e) {
     res.status(500).send("QR error");
   }
 });
 
-// Listar chats
-app.get("/sessions/:id/chats", guard, async (req, res) => {
+// Lista de chats
+app.get("/sessions/:id/chats", async (req, res) => {
   try {
     const { id } = req.params;
-    const limit = Math.min(Number(req.query.limit || 200), 1000);
-    const ref = ensureSession(id);
-    if (!ref?.sock) return res.status(404).json({ error: "Session not found" });
+    const force = req.query.force === "1" || req.query.force === "true";
+    const limit = Number(req.query.limit || 200);
 
-    let chats = ref.store?.chats?.all?.() || [];
-    chats.sort(
-      (a, b) =>
-        Number(b?.lastMessageRecvTimestamp || 0) -
-        Number(a?.lastMessageRecvTimestamp || 0)
-    );
-    res.json({ ok: true, chats: chats.slice(0, limit) });
+    const sess = sessions.get(id);
+    if (!sess?.sock) return res.status(404).json({ error: "Session not found" });
+
+    // Si quieres forzar refresco (primera vez, etc.)
+    if (force) {
+      try {
+        // cargar algo del historial ayuda a poblar el store
+        await sess.sock.presenceSubscribe(sess.sock.user?.id);
+      } catch {}
+    }
+
+    // store.chats.all() devuelve { id, name, ... } si ya se pobló
+    const all = sess.store?.chats?.all?.() || [];
+    res.json({ ok: true, chats: all.slice(0, limit) });
   } catch (e) {
-    res.status(500).json({ error: String(e?.message || e) });
+    res.status(500).json({ error: String(e.message || e) });
   }
 });
 
-// Listar mensajes de un chat
-app.get("/sessions/:id/messages", guard, async (req, res) => {
+// Lista de mensajes de un chat (usar jid URL-encoded)
+app.get("/sessions/:id/messages", async (req, res) => {
   try {
     const { id } = req.params;
-    let { jid, limit } = req.query;
-    limit = Math.min(Number(limit || 50), 200);
+    let { jid, count } = req.query;
+    if (!jid) return res.status(400).json({ error: "Missing 'jid' query param" });
 
-    const ref = ensureSession(id);
-    if (!ref?.sock) return res.status(404).json({ error: "Session not found" });
-    if (!jid) return res.status(400).json({ error: "Missing jid" });
+    jid = decodeURIComponent(jid);
+    count = Number(count || 50);
 
-    const j = decodeURIComponent(String(jid));
-    let msgs = [];
-    try {
-      msgs = ref.store?.messages?.[j]?.array?.() || [];
-    } catch {}
+    const sess = sessions.get(id);
+    if (!sess?.sock) return res.status(404).json({ error: "Session not found" });
 
-    if (!msgs?.length) {
-      const resLoad = await ref.sock.loadMessages(j, limit);
-      msgs = resLoad || [];
+    // intenta store primero
+    const fromStore = sess.store?.messages?.[jid];
+    if (fromStore?.array?.length) {
+      return res.json({ ok: true, messages: fromStore.array.slice(-count) });
     }
 
-    const out = msgs.map((m) => ({
-      id: m?.key?.id,
-      fromMe: m?.key?.fromMe,
-      pushName: m?.pushName,
-      messageTimestamp: Number(m?.messageTimestamp) || 0,
-      message: m?.message,
-    }));
-
-    out.sort((a, b) => a.messageTimestamp - b.messageTimestamp);
-    res.json({ ok: true, messages: out.slice(-Number(limit)) });
+    // si no hay en store, pide a WhatsApp
+    const msgs = await sess.sock.loadMessages(jid, count);
+    res.json({ ok: true, messages: msgs || [] });
   } catch (e) {
-    res.status(500).json({ error: String(e?.message || e) });
+    res.status(500).json({ error: String(e.message || e) });
   }
 });
 
 // Enviar mensaje
-app.post("/sessions/:id/send", guard, async (req, res) => {
+app.post("/sessions/:id/send", async (req, res) => {
   try {
     const { id } = req.params;
     const { to, text } = req.body || {};
-    const ref = ensureSession(id);
-    if (!ref?.sock) return res.status(404).json({ error: "Session not found" });
     if (!to || !text) return res.status(400).json({ error: "Missing 'to' or 'text'" });
 
-    let jid = String(to).trim();
-    if (!/@s\.whatsapp\.net$|@g\.us$/.test(jid)) {
-      const num = jid.replace(/\D+/g, "");
-      jid = `${num}@s.whatsapp.net`;
+    // Normaliza JID para individuos: E164@s.whatsapp.net
+    let jid = to;
+    if (!/@g\.us$/.test(jid) && !/@s\.whatsapp\.net$/.test(jid)) {
+      // e.g. 57321...  => 57321...@s.whatsapp.net
+      jid = `${to}@s.whatsapp.net`;
     }
-    if (!validJid(jid)) return res.status(400).json({ error: "Invalid jid" });
 
-    const r = await ref.sock.sendMessage(jid, { text: String(text) });
-    return res.json({ ok: true, id: r?.key?.id || null });
+    const sess = sessions.get(id);
+    if (!sess?.sock || !sess.connected) return res.status(400).json({ error: "Not connected" });
+
+    const r = await sess.sock.sendMessage(jid, { text });
+    res.json({ ok: true, id: r?.key?.id || null });
   } catch (e) {
-    log.error({ err: e?.message || e }, "send error");
-    res.status(500).json({ error: String(e?.message || e) });
+    log.error({ err: e }, "send error");
+    res.status(500).json({ error: String(e.message || e) });
   }
 });
 
 // SSE en vivo
 app.get("/sessions/:id/stream", async (req, res) => {
-  const { id } = req.params;
+  try {
+    const { id } = req.params;
+    const sess = sessions.get(id) || (await startSession(id));
 
-  if (!ensureSession(id)) {
-    try { await startSession(id); } catch {}
+    // cabeceras SSE
+    res.setHeader("Content-Type", "text/event-stream");
+    res.setHeader("Cache-Control", "no-cache, no-transform");
+    res.setHeader("Connection", "keep-alive");
+
+    // conexión abierta
+    res.write(`event: ready\n`);
+    res.write(`data: ${JSON.stringify({ ts: Date.now() })}\n\n`);
+
+    sess.sseClients.add(res);
+
+    req.on("close", () => {
+      sess.sseClients.delete(res);
+    });
+  } catch (e) {
+    res.status(500).end();
   }
-  if (!sseMap.get(id)) sseMap.set(id, new EventEmitter());
-
-  res.setHeader("Content-Type", "text/event-stream; charset=utf-8");
-  res.setHeader("Cache-Control", "no-cache, no-transform");
-  res.setHeader("Connection", "keep-alive");
-  res.setHeader("X-Accel-Buffering", "no");
-  res.flushHeaders?.();
-
-  const send = (event, data) => {
-    res.write(`event: ${event}\n`);
-    res.write(`data: ${JSON.stringify(data)}\n\n`);
-  };
-
-  send("ready", { ts: Date.now() });
-  const hb = setInterval(() => send("ping", { ts: Date.now() }), 15000);
-
-  const emitter = sseMap.get(id);
-  const onSse = ({ event, payload, ts }) => send(event, { sessionId: id, payload, ts });
-
-  emitter.on("sse", onSse);
-
-  req.on("close", () => {
-    clearInterval(hb);
-    emitter.off("sse", onSse);
-    res.end();
-  });
 });
 
-// ====== START ======
+// Borrar sesión (logout + borrar auth)
+app.delete("/sessions/:id", async (req, res) => {
+  try {
+    const { id } = req.params;
+    const sess = sessions.get(id);
+    if (sess?.sock) {
+      try { await sess.sock.logout(); } catch {}
+      try { sess.sock.end?.(); } catch {}
+    }
+    sessions.delete(id);
+
+    const authDir = path.join(__dirname, "auth", id);
+    await removeDir(authDir);
+
+    res.json({ ok: true, sessionId: id, deleted: true });
+  } catch (e) {
+    res.status(500).json({ error: String(e.message || e) });
+  }
+});
+
+// ---------- Arranque ----------
 app.listen(PORT, () => {
-  log.info({ port: PORT }, "Baileys microservice running");
+  log.info(`Baileys microservice running on ${PORT}`);
 });
