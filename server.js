@@ -8,7 +8,8 @@ import { fileURLToPath } from "node:url";
 import fs from "node:fs/promises";
 import QRCode from "qrcode";
 
-import makeWASocket, {
+import {
+  makeWASocket,
   useMultiFileAuthState,
   fetchLatestBaileysVersion,
   DisconnectReason,
@@ -16,404 +17,373 @@ import makeWASocket, {
   Browsers,
 } from "@whiskeysockets/baileys";
 
-// --- Baileys Store: import resiliente (Store.js vs store.js) ---
-let makeInMemoryStore;
-try {
-  ({ makeInMemoryStore } = await import("@whiskeysockets/baileys/lib/Store.js"));
-} catch {
-  ({ makeInMemoryStore } = await import("@whiskeysockets/baileys/lib/store.js"));
-}
+// 👇 Import correcto (en Linux es case-sensitive)
+import { makeInMemoryStore } from "@whiskeysockets/baileys/lib/Store.js";
 
-// ---------- Config ----------
-const PORT = process.env.PORT || 3000;
-const API_KEY = process.env.API_KEY || ""; // ej: "Nicolasperes00*!"
+/* -------------------------- Configuración básica ------------------------- */
+
+const PORT = Number(process.env.PORT || 3000);
+const API_KEY = process.env.API_KEY; // ej: "Nicolasperes00*!"
 const ALLOWED_ORIGIN = process.env.ALLOWED_ORIGIN || "*";
 
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = path.dirname(__filename);
-const AUTH_DIR = path.join(__dirname, "auth");
-
-// ---------- Infra ----------
 const app = express();
-app.use(express.json({ limit: "1mb" }));
+app.use(express.json());
 app.use(
   cors({
-    origin: ALLOWED_ORIGIN === "*" ? true : ALLOWED_ORIGIN,
-    credentials: false,
+    origin: ALLOWED_ORIGIN === "*" ? true : ALLOWED_ORIGIN.split(","),
   })
 );
 
-// Logger
-const logger = pino({ level: process.env.LOG_LEVEL || "info" });
+// Middleware API Key (excepto health)
+app.use((req, res, next) => {
+  if (req.path === "/") return next();
+  if (!API_KEY) {
+    return res
+      .status(500)
+      .json({ error: "Server misconfigured: missing API_KEY env" });
+  }
+  const k = req.header("x-api-key");
+  if (!k || k !== API_KEY) return res.status(401).json({ error: "Unauthorized" });
+  next();
+});
 
-// Memoria de runtime
-/** @typedef {{ sock:any, store:any, state:any, saveCreds:Function, connected:boolean, lastQr:string|null }} Session */
-const sessions = new Map(); // sessionId => Session
+// Health
+app.get("/", (_req, res) => res.json({ ok: true, service: "baileys-microservice" }));
 
-// ---------- Helpers ----------
-function requireApiKey(req, res, next) {
-  const key = req.header("x-api-key") || "";
-  if (!API_KEY) return res.status(500).json({ error: "API key not configured" });
-  if (key !== API_KEY) return res.status(401).json({ error: "Unauthorized" });
-  return next();
+/* --------------------------------- Estado -------------------------------- */
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+const AUTH_ROOT = path.join(__dirname, "auth");
+
+// Mapas por sesión
+const sessions = new Map(); // sessionId -> sock
+const stores = new Map();   // sessionId -> store
+const lastQR = new Map();   // sessionId -> string (data del QR)
+const sseClients = new Map(); // sessionId -> Set(res)
+
+/* ------------------------- Utilidades / helpers -------------------------- */
+
+const logger = pino({ level: "info" });
+
+async function ensureDir(p) {
+  await fs.mkdir(p, { recursive: true }).catch(() => {});
 }
 
-async function ensureDir(dir) {
-  await fs.mkdir(dir, { recursive: true });
+function toDataURItoBuffer(dataURI) {
+  const base64 = dataURI.split(",")[1];
+  return Buffer.from(base64, "base64");
 }
 
-function ok(res, data = {}) {
-  return res.json({ ok: true, ...data });
-}
-
-function fail(res, code, err) {
-  logger.error({ err }, "Request error");
-  return res.status(code).json({ error: String(err?.message || err) });
-}
-
-function jidToHuman(jid) {
-  try {
-    const d = jidDecode(jid);
-    if (!d?.user) return jid;
-    return `${d.user}${d.server ? "@" + d.server : ""}`;
-  } catch {
-    return jid;
+function broadcast(sessionId, event, payload) {
+  const clients = sseClients.get(sessionId);
+  if (!clients || clients.size === 0) return;
+  const line = `event: ${event}\n` + `data: ${JSON.stringify(payload)}\n\n`;
+  for (const res of clients) {
+    try {
+      res.write(line);
+    } catch {}
   }
 }
 
-// “Poblar” store con algunos chats/mensajes
-async function softRefreshChats(sessionId, limit = 50) {
-  const s = sessions.get(sessionId);
-  if (!s?.sock) return;
-
-  try {
-    // Llamada “suave” que acostumbra a poblar la store.
-    await s.sock.ws?.sendRawMessage?.(
-      JSON.stringify({ tag: "query", content: "chats", limit })
-    );
-  } catch (e) {
-    logger.warn({ e }, "softRefreshChats ws.sendRawMessage failed (non-fatal)");
+function sseKeepAlive(sessionId) {
+  const clients = sseClients.get(sessionId);
+  if (!clients || clients.size === 0) return;
+  const line = `event: keepalive\n` + `data: {"ts":${Date.now()}}\n\n`;
+  for (const res of clients) {
+    try {
+      res.write(line);
+    } catch {}
   }
 }
 
-// Force refresh: usa la API para pedir la lista
-async function forceLoadChats(sessionId, limit = 200) {
-  const s = sessions.get(sessionId);
-  if (!s?.sock) return;
-  try {
-    await s.sock?.fetchPrivacySettings?.(); // innocua
-    // No hay API pública “fetchChats”; nos apoyamos en la store y/o
-    // en el efecto de las notificaciones de history.
-    await softRefreshChats(sessionId, limit);
-  } catch (e) {
-    logger.warn({ e }, "forceLoadChats failed (non-fatal)");
-  }
-}
+/* --------------------------- Crear / Obtener sock ------------------------ */
 
-// ---------- Core: start socket ----------
 async function startSession(sessionId) {
-  await ensureDir(AUTH_DIR);
-  const sessionDir = path.join(AUTH_DIR, sessionId);
-  await ensureDir(sessionDir);
+  const authDir = path.join(AUTH_ROOT, sessionId);
+  await ensureDir(authDir);
 
-  const { state, saveCreds } = await useMultiFileAuthState(sessionDir);
-  const store = makeInMemoryStore({ logger });
-
+  const { state, saveCreds } = await useMultiFileAuthState(authDir);
   const { version } = await fetchLatestBaileysVersion();
+
+  const store = makeInMemoryStore({ logger });
+  stores.set(sessionId, store);
+
   const sock = makeWASocket({
     version,
-    printQRInTerminal: false,
     auth: state,
-    browser: Browsers.appropriate("Veroz/Service"),
-    syncFullHistory: false, // reduce carga
+    printQRInTerminal: false,
     logger,
+    browser: Browsers.macOS("Chrome"),
+    syncFullHistory: false,
+    markOnlineOnConnect: false,
   });
 
   store.bind(sock.ev);
+  sessions.set(sessionId, sock);
 
-  const s = {
-    sock,
-    store,
-    state,
-    saveCreds,
-    connected: false,
-    lastQr: null,
-  };
-  sessions.set(sessionId, s);
+  // Eventos de conexión
+  sock.ev.process(async (events) => {
+    if (events["connection.update"]) {
+      const { connection, lastDisconnect, qr } = events["connection.update"];
 
-  // Eventos
-  sock.ev.on("creds.update", async () => {
-    await saveCreds();
-    // si quieres emitir por SSE, el stream ya lo maneja abajo
-  });
+      if (qr) {
+        lastQR.set(sessionId, qr);
+        broadcast(sessionId, "qr.update", { sessionId, ts: Date.now() });
+      }
 
-  sock.ev.on("connection.update", (u) => {
-    const { connection, lastDisconnect, qr } = u;
-    if (qr) {
-      s.lastQr = qr;
-    }
-    if (connection === "open") {
-      s.connected = true;
-      logger.info({ sessionId }, "WA connected");
-    } else if (connection === "close") {
-      s.connected = false;
-      const code = lastDisconnect?.error?.output?.statusCode || lastDisconnect?.error?.code;
-      if (code === DisconnectReason.loggedOut) {
-        logger.warn({ sessionId }, "Logged out, clearing session");
+      if (connection === "open") {
+        logger.info({ sessionId }, "WA connected");
+        broadcast(sessionId, "ready", { ts: Date.now() });
+      }
+
+      if (connection === "close") {
+        const reason =
+          lastDisconnect?.error?.output?.statusCode ||
+          lastDisconnect?.error?.status ||
+          lastDisconnect?.error?.code;
+
+        logger.warn({ sessionId, reason }, "WA disconnected");
+
+        if (reason === DisconnectReason.loggedOut) {
+          // limpie auth; pedirá nuevo QR
+          try {
+            await fs.rm(authDir, { recursive: true, force: true });
+          } catch {}
+          lastQR.delete(sessionId);
+        }
+
         sessions.delete(sessionId);
-      } else {
-        logger.warn({ sessionId, code }, "Connection closed");
+        stores.delete(sessionId);
       }
     }
-  });
 
-  // “Despierte” la store
-  setTimeout(() => softRefreshChats(sessionId, 50), 2000);
-
-  return s;
-}
-
-function getSession(sessionId) {
-  return sessions.get(sessionId);
-}
-
-// ---------- Endpoints ----------
-
-// Health
-app.get("/", (req, res) => ok(res, { service: "baileys-microservice" }));
-
-// Crear / recargar sesión
-app.post("/sessions", requireApiKey, async (req, res) => {
-  try {
-    const { sessionId } = req.body || {};
-    if (!sessionId) return res.status(400).json({ error: "Missing 'sessionId'" });
-
-    let s = getSession(sessionId);
-    if (!s) {
-      s = await startSession(sessionId);
-    }
-    return ok(res, { sessionId });
-  } catch (e) {
-    return fail(res, 500, e);
-  }
-});
-
-// Estado
-app.get("/sessions/:id/status", requireApiKey, async (req, res) => {
-  try {
-    const { id } = req.params;
-    const s = getSession(id);
-    if (!s) return res.status(400).json({ error: "Session not found" });
-
-    return ok(res, {
-      connected: !!s.connected,
-      me: s.sock?.user || null,
-    });
-  } catch (e) {
-    return fail(res, 500, e);
-  }
-});
-
-// QR
-app.get("/sessions/:id/qr.png", requireApiKey, async (req, res) => {
-  try {
-    const { id } = req.params;
-    let s = getSession(id);
-    if (!s) s = await startSession(id);
-
-    if (s.connected) {
-      // Ya conectado: no hay QR
-      res.type("text/plain").status(200).send("Already connected");
-      return;
-    }
-    if (!s.lastQr) {
-      return res.status(404).send("QR not ready");
-    }
-    const dataUrl = await QRCode.toDataURL(s.lastQr, { margin: 1, scale: 6 });
-    const base64 = dataUrl.split(",")[1];
-    const buf = Buffer.from(base64, "base64");
-
-    res.setHeader("Content-Type", "image/png");
-    res.setHeader("Content-Length", buf.length);
-    res.status(200).send(buf);
-  } catch (e) {
-    fail(res, 500, e);
-  }
-});
-
-// Listar chats (opcional force y limit)
-app.get("/sessions/:id/chats", requireApiKey, async (req, res) => {
-  try {
-    const { id } = req.params;
-    const { force, limit } = req.query;
-    const s = getSession(id);
-    if (!s) return res.status(400).json({ error: "Session not found" });
-
-    const lim = Math.min(Number(limit) || 50, 500);
-
-    if (String(force) === "1") {
-      await forceLoadChats(id, lim);
-      // pequeña espera para permitir poblar la store
-      await new Promise((r) => setTimeout(r, 800));
+    if (events["creds.update"]) {
+      await saveCreds();
+      broadcast(sessionId, "creds.update", { ts: Date.now() });
     }
 
-    const chatsArr = s.store?.chats?.all() || [];
-    // Normaliza mínimo: id (jid) y nombre pushName si está
-    const data = chatsArr.map((c) => ({
-      id: c.id,
-      name: c.name || c.subject || jidToHuman(c.id),
-      unreadCount: c.unreadCount || 0,
-    }));
-
-    return ok(res, { chats: data });
-  } catch (e) {
-    return fail(res, 500, e);
-  }
-});
-
-// Listar mensajes de un chat (usar ?jid=... url-encoded)
-app.get("/sessions/:id/messages", requireApiKey, async (req, res) => {
-  try {
-    const { id } = req.params;
-    const { jid } = req.query;
-    if (!jid) return res.status(400).json({ error: "Missing 'jid' query param" });
-
-    const s = getSession(id);
-    if (!s) return res.status(400).json({ error: "Session not found" });
-
-    const msgs = s.store?.messages?.get(jid) || [];
-    // Normaliza un poco la estructura
-    const mapped = msgs.map((m) => {
-      const content = m.message?.conversation
-        ?? m.message?.extendedTextMessage?.text
-        ?? m.message?.imageMessage
-        ?? m.message?.videoMessage
-        ?? m.message?.buttonsResponseMessage
-        ?? m.message?.templateButtonReplyMessage
-        ?? m.message?.audioMessage
-        ?? null;
-
-      return {
-        key: m.key,
-        pushName: m.pushName,
-        messageTimestamp: m.messageTimestamp,
-        fromMe: m.key?.fromMe || false,
-        status: m.status ?? null,
-        message: content,
-      };
-    });
-
-    return ok(res, { messages: mapped });
-  } catch (e) {
-    return fail(res, 500, e);
-  }
-});
-
-// Enviar mensaje de texto
-app.post("/sessions/:id/send", requireApiKey, async (req, res) => {
-  try {
-    const { id } = req.params;
-    const { to, text } = req.body || {};
-    if (!to || !text) return res.status(400).json({ error: "Missing 'to' or 'text'" });
-
-    // Validación simple de JID
-    if (!/@s\.whatsapp\.net$|@g\.us$/.test(to)) {
-      return res.status(400).json({
-        error: "Invalid jid. For individuals use <E164>@s.whatsapp.net",
+    if (events["messages.upsert"]) {
+      const { messages } = events["messages.upsert"];
+      // Notificación ligera (para UI). La carga grande la pide la UI al endpoint /messages
+      broadcast(sessionId, "messages.upsert", {
+        sessionId,
+        payload: { type: "notify", count: messages?.length || 0 },
+        ts: Date.now(),
       });
     }
 
-    const s = getSession(id);
-    if (!s || !s.connected) {
-      return res.status(400).json({ error: "Not connected. Create session and scan QR." });
+    if (events["chats.upsert"] || events["chats.update"]) {
+      broadcast(sessionId, "chats.update", {
+        sessionId,
+        payload: { count: 1 },
+        ts: Date.now(),
+      });
     }
+  });
 
-    const r = await s.sock.sendMessage(to, { text });
-    return ok(res, { id: r.key?.id || null });
+  return sock;
+}
+
+async function getSession(sessionId) {
+  let sock = sessions.get(sessionId);
+  if (sock) return sock;
+  sock = await startSession(sessionId);
+  return sock;
+}
+
+/* -------------------------------- Endpoints ------------------------------ */
+
+/**
+ * POST /sessions
+ * body: { "sessionId": "cliente-123" }
+ * Crea o rehidrata una sesión (dispara QR si no hay auth).
+ */
+app.post("/sessions", async (req, res) => {
+  try {
+    const { sessionId } = req.body || {};
+    if (!sessionId) return res.status(400).json({ error: "Missing sessionId" });
+
+    await getSession(sessionId);
+    return res.json({ ok: true, sessionId });
   } catch (e) {
-    return fail(res, 500, e);
+    logger.error(e);
+    return res.status(500).json({ error: String(e.message || e) });
   }
 });
 
-// SSE: stream en vivo
-app.get("/sessions/:id/stream", requireApiKey, async (req, res) => {
+/**
+ * GET /sessions/:id/status
+ * Devuelve si está conectado y el jid propio si aplica.
+ */
+app.get("/sessions/:id/status", async (req, res) => {
   try {
-    const { id } = req.params;
-    const s = getSession(id);
-    if (!s) return res.status(400).json({ error: "Session not found" });
-
-    res.setHeader("Content-Type", "text/event-stream");
-    res.setHeader("Cache-Control", "no-cache, no-transform");
-    res.setHeader("Connection", "keep-alive");
-    res.flushHeaders?.();
-
-    const send = (event, data) => {
-      res.write(`event: ${event}\n`);
-      res.write(`data: ${JSON.stringify(data)}\n\n`);
-    };
-
-    // Marca de listo
-    send("ready", { ts: Date.now() });
-
-    // Suscripciones
-    const unsub = [];
-
-    unsub.push(
-      s.sock.ev.on("messages.upsert", (payload) => {
-        send("messages.upsert", { sessionId: id, payload, ts: Date.now() });
-      })
-    );
-    unsub.push(
-      s.sock.ev.on("chats.update", (payload) => {
-        send("chats.update", { sessionId: id, payload, ts: Date.now() });
-      })
-    );
-    unsub.push(
-      s.sock.ev.on("creds.update", (payload) => {
-        send("creds.update", { sessionId: id, payload, ts: Date.now() });
-      })
-    );
-    unsub.push(
-      s.sock.ev.on("connection.update", (payload) => {
-        send("connection.update", { sessionId: id, payload, ts: Date.now() });
-      })
-    );
-
-    // Ping keep-alive
-    const ping = setInterval(() => send("ping", { ts: Date.now() }), 25000);
-
-    req.on("close", () => {
-      try {
-        clearInterval(ping);
-        unsub.forEach((u) => u && typeof u === "function" && u());
-      } catch {}
-      res.end();
+    const id = req.params.id;
+    const sock = sessions.get(id);
+    const connected = !!sock?.user;
+    return res.json({
+      connected,
+      me: connected ? { id: sock.user?.id } : null,
     });
   } catch (e) {
-    return fail(res, 500, e);
+    return res.status(500).json({ error: String(e.message || e) });
   }
 });
 
-// Borrar sesión (opcional)
-app.delete("/sessions/:id", requireApiKey, async (req, res) => {
+/**
+ * GET /sessions/:id/qr.png
+ * Devuelve el último QR capturado para esa sesión en PNG.
+ */
+app.get("/sessions/:id/qr.png", async (req, res) => {
+  const id = req.params.id;
+  const qr = lastQR.get(id);
+  if (!qr) return res.status(404).send("QR not ready");
   try {
-    const { id } = req.params;
-    const s = getSession(id);
-    if (s) {
-      try { await s.sock.logout?.(); } catch {}
-      sessions.delete(id);
-    }
-    // limpiar auth
-    const dir = path.join(AUTH_DIR, id);
-    try { await fs.rm(dir, { recursive: true, force: true }); } catch {}
-    return ok(res, { cleared: true });
+    const dataURI = await QRCode.toDataURL(qr, { margin: 1, width: 256 });
+    const buf = toDataURItoBuffer(dataURI);
+    res.setHeader("Content-Type", "image/png");
+    return res.send(buf);
   } catch (e) {
-    return fail(res, 500, e);
+    return res.status(500).json({ error: String(e.message || e) });
   }
 });
 
-// ---------- Start ----------
-app.listen(PORT, async () => {
-  await ensureDir(AUTH_DIR);
+/**
+ * GET /sessions/:id/chats
+ * Lista chats del store. (param: ?force=1 para forzar sync ligero)
+ * opcional ?limit=200 (sólo para UI; no corta el store real)
+ */
+app.get("/sessions/:id/chats", async (req, res) => {
+  try {
+    const id = req.params.id;
+    const limit = Number(req.query.limit || 0);
+    const _force = String(req.query.force || "0") === "1";
+
+    const store = stores.get(id);
+    if (!store) return res.json({ ok: true, chats: [] });
+
+    // El store guarda en store.chats (map). Lo exponemos como array simple.
+    const all = store.chats ? Array.from(store.chats.values()) : [];
+    const out = limit > 0 ? all.slice(0, limit) : all;
+
+    // “force” notifica a la UI que hubo petición explícita
+    if (_force) {
+      broadcast(id, "chats.update", { sessionId: id, payload: { count: out.length } });
+    }
+
+    return res.json({ ok: true, chats: out });
+  } catch (e) {
+    return res.status(500).json({ error: String(e.message || e) });
+  }
+});
+
+/**
+ * GET /sessions/:id/messages?jid=<waId@s.whatsapp.net>&limit=50
+ * Retorna mensajes de ese chat desde el store (y si no hay, intenta cargar algunos).
+ */
+app.get("/sessions/:id/messages", async (req, res) => {
+  try {
+    const id = req.params.id;
+    const jidRaw = req.query.jid;
+    const limit = Number(req.query.limit || 50);
+    if (!jidRaw) return res.status(400).json({ error: "Missing jid" });
+
+    const jid = decodeURIComponent(jidRaw);
+    const store = stores.get(id);
+    const sock = sessions.get(id);
+
+    if (!store || !sock) return res.json({ ok: true, messages: [] });
+
+    // Cargar desde el store
+    let msgs = await store.loadMessages(jid, limit);
+    if (!msgs || msgs.length === 0) {
+      // Si no hay en memoria, intenta pedir un poco al server
+      try {
+        const page = await sock?.loadMessages(jid, limit);
+        // store.loadMessages ya las indexa vía bind(ev),
+        // pero devolvemos lo obtenido para no esperar el rebind.
+        msgs = page || [];
+      } catch {
+        msgs = [];
+      }
+    }
+
+    return res.json({ ok: true, messages: msgs });
+  } catch (e) {
+    return res.status(500).json({ error: String(e.message || e) });
+  }
+});
+
+/**
+ * POST /sessions/:id/send
+ * body: { "to": "573xxxx@s.whatsapp.net", "text": "Hola" }
+ */
+app.post("/sessions/:id/send", async (req, res) => {
+  try {
+    const id = req.params.id;
+    const { to, text } = req.body || {};
+    if (!to || !text) return res.status(400).json({ error: "Missing 'to' or 'text'" });
+
+    const sock = sessions.get(id);
+    if (!sock || !sock.user) {
+      return res.status(400).json({ error: "Session not ready" });
+    }
+
+    const r = await sock.sendMessage(to, { text });
+    return res.json({ ok: true, id: r?.key?.id || null });
+  } catch (e) {
+    return res.status(500).json({ error: String(e.message || e) });
+  }
+});
+
+/**
+ * GET /sessions/:id/stream
+ * Server-Sent Events: empuja eventos live (ready, chats.update, messages.upsert, creds.update, keepalive).
+ */
+app.get("/sessions/:id/stream", async (req, res) => {
+  const id = req.params.id;
+
+  // Iniciar headers SSE
+  res.writeHead(200, {
+    "Content-Type": "text/event-stream",
+    "Cache-Control": "no-cache, no-transform",
+    Connection: "keep-alive",
+    "X-Accel-Buffering": "no", // para proxies
+  });
+
+  // (re)crear sesión si no existe -> dispara QR si hace falta
+  try {
+    await getSession(id);
+  } catch (e) {
+    res.write(`event: error\n`);
+    res.write(`data: ${JSON.stringify({ error: String(e.message || e) })}\n\n`);
+  }
+
+  // registrar cliente
+  if (!sseClients.has(id)) sseClients.set(id, new Set());
+  sseClients.get(id).add(res);
+
+  // primer ping
+  res.write(`event: ready\n`);
+  res.write(`data: {"ts":${Date.now()}}\n\n`);
+
+  // keepalive
+  const ka = setInterval(() => sseKeepAlive(id), 25000);
+
+  req.on("close", () => {
+    clearInterval(ka);
+    const set = sseClients.get(id);
+    if (set) {
+      set.delete(res);
+      if (set.size === 0) sseClients.delete(id);
+    }
+  });
+});
+
+/* --------------------------------- Arranque ------------------------------ */
+
+await ensureDir(AUTH_ROOT);
+
+app.listen(PORT, () => {
   logger.info(`Baileys microservice running on ${PORT}`);
 });
