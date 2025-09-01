@@ -8,20 +8,7 @@ if (typeof globalThis.btoa === "undefined") {
   globalThis.btoa = (d) => Buffer.from(d, "binary").toString("base64");
 }
 
-// ---------- Imports ----------
-// 👉 Importamos TODO y resolvemos el export real en runtime (default vs named)
-import * as Baileys from "@whiskeysockets/baileys";
-const makeWASocket =
-  // v6 suele exportar default; otras builds exportan named
-  Baileys.default || Baileys.makeWASocket;
-const {
-  useMultiFileAuthState,
-  makeInMemoryStore,
-  jidNormalizedUser,
-  DisconnectReason,
-  fetchLatestBaileysVersion,
-} = Baileys;
-
+// ---------- Imports básicos ----------
 import express from "express";
 import bodyParser from "body-parser";
 import cors from "cors";
@@ -29,6 +16,40 @@ import fs from "fs";
 import path from "path";
 import QRCode from "qrcode";
 import { fileURLToPath } from "url";
+import { createRequire } from "module";
+
+// ---------- Baileys import compatible (ESM + require) ----------
+const require = createRequire(import.meta.url);
+const Baileys = require("@whiskeysockets/baileys");
+
+// Resolver export según build (default o named)
+const makeWASocket =
+  (typeof Baileys === "function" ? Baileys : null) ||
+  Baileys.makeWASocket ||
+  (Baileys.default && (
+    (typeof Baileys.default === "function" ? Baileys.default : null) ||
+    Baileys.default.makeWASocket
+  ));
+
+const useMultiFileAuthState =
+  Baileys.useMultiFileAuthState || Baileys.default?.useMultiFileAuthState;
+
+const makeInMemoryStore =
+  Baileys.makeInMemoryStore || Baileys.default?.makeInMemoryStore;
+
+const jidNormalizedUser =
+  Baileys.jidNormalizedUser || Baileys.default?.jidNormalizedUser;
+
+const DisconnectReason =
+  Baileys.DisconnectReason || Baileys.default?.DisconnectReason;
+
+const fetchLatestBaileysVersion =
+  Baileys.fetchLatestBaileysVersion || Baileys.default?.fetchLatestBaileysVersion;
+
+if (typeof makeWASocket !== "function") {
+  console.error("Baileys exports:", Object.keys(Baileys));
+  throw new Error("makeWASocket export not found (default/named).");
+}
 
 // ---------- Paths util ----------
 const __filename = fileURLToPath(import.meta.url);
@@ -51,7 +72,7 @@ app.use(
   })
 );
 
-// API key sólo en POST/DELETE
+// API key sólo para POST/DELETE
 app.use((req, res, next) => {
   if (req.method === "GET") return next();
   const key = req.headers["x-api-key"];
@@ -79,10 +100,6 @@ const broadcast = (event, payload) => {
 
 // ---------- Baileys ----------
 async function startSock() {
-  if (typeof makeWASocket !== "function") {
-    throw new Error("makeWASocket export not resolved (default/named).");
-  }
-
   const { state, saveCreds } = await useMultiFileAuthState(SESSION_DIR);
   const { version } = await fetchLatestBaileysVersion();
 
@@ -92,9 +109,9 @@ async function startSock() {
     printQRInTerminal: false,
     syncFullHistory: true,
     browser: ["Ubuntu", "Chrome", "122.0"],
-    markOnlineOnConnect: true,     // evitar “en pausa”
+    markOnlineOnConnect: true,     // evitar “En pausa”
     keepAliveIntervalMs: 30000,    // heartbeat
-    emitOwnEvents: true,           // emits para propios envíos/acks
+    emitOwnEvents: true            // emitir acks/envíos propios
   });
 
   // Mantener presencia “available”
@@ -102,7 +119,7 @@ async function startSock() {
     try { sock.sendPresenceUpdate("available"); } catch {}
   }, 30000);
 
-  // Vincular store para que /chats funcione
+  // Vincular store para /chats y /messages
   store.bind(sock.ev);
 
   sock.ev.process(async (events) => {
@@ -118,7 +135,7 @@ async function startSock() {
       if (qr) {
         latestQR = qr;
         try { fs.writeFileSync(QR_FILE, JSON.stringify({ qr }), "utf8"); } catch {}
-        broadcast("qr", { qr: true }); // notificación de QR nuevo
+        broadcast("qr", { qr: true }); // notifica que hay QR nuevo
       }
 
       if (connection === "open") {
@@ -142,12 +159,10 @@ async function startSock() {
       broadcast("chats.set", { chats, isLatest });
     }
     if (events["chats.upsert"]) {
-      const { chats } = events["chats.upsert"];
-      broadcast("chats.upsert", { chats });
+      broadcast("chats.upsert", events["chats.upsert"]);
     }
     if (events["chats.update"]) {
-      const { updates } = events["chats.update"];
-      broadcast("chats.update", { updates });
+      broadcast("chats.update", events["chats.update"]);
     }
 
     // Mensajes
@@ -165,7 +180,7 @@ async function startSock() {
 
 // ---------- Rutas ----------
 
-// QR como data URL
+// QR como data URL (para <img src="...">)
 app.get("/session/qr", async (_req, res) => {
   try {
     const qrText = latestQR
@@ -181,7 +196,7 @@ app.get("/session/qr", async (_req, res) => {
   }
 });
 
-// Estado
+// Estado de sesión
 app.get("/session/status", (_req, res) => {
   res.json({ connected: !!(sock && sock.user), user: sock?.user || null });
 });
@@ -196,7 +211,7 @@ app.get("/chats", (_req, res) => {
   }
 });
 
-// Historial (paginación hacia atrás con cursorId)
+// Historial de mensajes (paginado hacia atrás con cursorId)
 app.get("/messages", async (req, res) => {
   const { jid, pageSize, cursorId } = req.query;
   if (!jid) return res.status(400).json({ error: "jid required" });
@@ -235,7 +250,7 @@ app.post("/messages/send", async (req, res) => {
   }
 });
 
-// SSE en vivo
+// SSE en vivo (hello + ping keep-alive)
 app.get("/events", (req, res) => {
   res.writeHead(200, {
     "Content-Type": "text/event-stream",
@@ -244,7 +259,7 @@ app.get("/events", (req, res) => {
     "Access-Control-Allow-Origin": ALLOWED_ORIGIN,
   });
 
-  // saludo inmediato
+  // saludo inicial
   res.write(`event: hello\ndata: ${JSON.stringify({ connected: !!sock?.user })}\n\n`);
 
   // keep-alive cada 25s
