@@ -9,6 +9,19 @@ if (typeof globalThis.btoa === "undefined") {
 }
 
 // ---------- Imports ----------
+// 👉 Importamos TODO y resolvemos el export real en runtime (default vs named)
+import * as Baileys from "@whiskeysockets/baileys";
+const makeWASocket =
+  // v6 suele exportar default; otras builds exportan named
+  Baileys.default || Baileys.makeWASocket;
+const {
+  useMultiFileAuthState,
+  makeInMemoryStore,
+  jidNormalizedUser,
+  DisconnectReason,
+  fetchLatestBaileysVersion,
+} = Baileys;
+
 import express from "express";
 import bodyParser from "body-parser";
 import cors from "cors";
@@ -16,14 +29,6 @@ import fs from "fs";
 import path from "path";
 import QRCode from "qrcode";
 import { fileURLToPath } from "url";
-
-import makeWASocket, {
-  useMultiFileAuthState,
-  makeInMemoryStore,
-  jidNormalizedUser,
-  DisconnectReason,
-  fetchLatestBaileysVersion,
-} from "@whiskeysockets/baileys";
 
 // ---------- Paths util ----------
 const __filename = fileURLToPath(import.meta.url);
@@ -74,6 +79,10 @@ const broadcast = (event, payload) => {
 
 // ---------- Baileys ----------
 async function startSock() {
+  if (typeof makeWASocket !== "function") {
+    throw new Error("makeWASocket export not resolved (default/named).");
+  }
+
   const { state, saveCreds } = await useMultiFileAuthState(SESSION_DIR);
   const { version } = await fetchLatestBaileysVersion();
 
