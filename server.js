@@ -1,45 +1,21 @@
-// --- Polyfills necesarios para Baileys ---
-import { webcrypto as _webcrypto } from "crypto";
-
-if (!globalThis.crypto) globalThis.crypto = _webcrypto;
-
-if (typeof globalThis.atob === "undefined") {
-  globalThis.atob = (data) => Buffer.from(data, "base64").toString("binary");
-}
-if (typeof globalThis.btoa === "undefined") {
-  globalThis.btoa = (data) => Buffer.from(data, "binary").toString("base64");
-}
-
-// --- Imports principales ---
 import express from "express";
 import bodyParser from "body-parser";
 import cors from "cors";
-import QRCode from "qrcode";
+import { join } from "path";
+import { Boom } from "@hapi/boom";
+import makeWASocket, { useMultiFileAuthState, jidNormalizedUser } from "@whiskeysockets/baileys";
 import fs from "fs";
-import path from "path";
-import { fileURLToPath } from "url";
 
-import {
-  makeWASocket,
-  useMultiFileAuthState,
-  fetchLatestBaileysVersion,
-  makeInMemoryStore,
-  jidNormalizedUser,
-  DisconnectReason
-} from "@whiskeysockets/baileys";
-
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = path.dirname(__filename);
+const app = express();
+app.use(bodyParser.json());
 
 // ====== ENV ======
 const ALLOWED_ORIGIN = process.env.ALLOWED_ORIGIN || "*";
 const API_KEY = process.env.API_KEY || "";
-const SESSION_DIR = process.env.SESSION_DIR || path.join(__dirname, "auth");
 const PORT = process.env.PORT || 3000;
+const SESSION_DIR = process.env.SESSION_DIR || "./sessions";
 
-// ====== EXPRESS ======
-const app = express();
-app.use(bodyParser.json());
+// ====== CORS ======
 app.use(
   cors({
     origin: ALLOWED_ORIGIN,
@@ -48,107 +24,123 @@ app.use(
   })
 );
 
-// ====== API KEY (solo POST necesita llave) ======
-const requireKey = (req, res, next) => {
-  if (req.method === "GET") return next();
-  const key = req.headers["x-api-key"];
-  if (!API_KEY || key === API_KEY) return next();
-  return res.status(401).json({ error: "invalid api key" });
-};
-app.use(requireKey);
-
-// ====== BAILEYS STORE ======
-if (!fs.existsSync(SESSION_DIR)) fs.mkdirSync(SESSION_DIR, { recursive: true });
-
-const store = makeInMemoryStore({});
-let sock = null;
-let authState = null;
-let qrData = { qr: null, ts: 0 };
-
-const sseClients = new Set();
-const broadcast = (event, payload) => {
-  const data = `event: ${event}\ndata: ${JSON.stringify(payload)}\n\n`;
-  for (const res of sseClients) {
-    try { res.write(data); } catch {}
+// ====== API KEY middleware ======
+app.use((req, res, next) => {
+  if (req.method === "POST" || req.method === "DELETE") {
+    const key = req.headers["x-api-key"];
+    if (!key || key !== API_KEY) {
+      return res.status(401).json({ error: "Unauthorized" });
+    }
   }
-};
+  next();
+});
 
-// ====== INIT WA SOCKET ======
+// ====== Global ======
+let sock;
+let sseClients = new Set();
+
+// ====== SSE Broadcast helper ======
+function broadcast(event, data) {
+  for (const client of sseClients) {
+    try {
+      client.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
+    } catch {}
+  }
+}
+
+// ====== Start Baileys ======
 async function startSock() {
   const { state, saveCreds } = await useMultiFileAuthState(SESSION_DIR);
-  authState = { state, saveCreds };
 
-  const { version } = await fetchLatestBaileysVersion();
   sock = makeWASocket({
-    version,
+    printQRInTerminal: false,
     auth: state,
     syncFullHistory: true,
-    markOnlineOnConnect: false,
-    printQRInTerminal: false,
+    browser: ["Ubuntu", "Chrome", "22.04.4"],
   });
-
-  store.bind(sock.ev);
 
   sock.ev.process(async (events) => {
     if (events["connection.update"]) {
-      const { connection, lastDisconnect, qr } = events["connection.update"];
-      if (qr) {
-        qrData = { qr, ts: Date.now() };
-        broadcast("qr", { qr });
+      const update = events["connection.update"];
+      if (update.qr) {
+        fs.writeFileSync(join(SESSION_DIR, "latest-qr.json"), JSON.stringify(update));
       }
-      if (connection === "open") {
-        qrData = { qr: null, ts: 0 };
+      if (update.connection === "open") {
         broadcast("ready", { user: sock.user });
       }
-      if (connection === "close") {
+      if (update.connection === "close") {
         const shouldReconnect =
-          (lastDisconnect?.error?.output?.statusCode !== DisconnectReason.loggedOut);
+          (update.lastDisconnect?.error as Boom)?.output?.statusCode !== 401;
         if (shouldReconnect) startSock();
       }
     }
 
-    if (events["creds.update"]) await saveCreds();
+    if (events["creds.update"]) {
+      await saveCreds();
+    }
 
     if (events["chats.set"]) {
-      const { chats } = events["chats.set"];
-      broadcast("chats.set", { chats });
+      broadcast("chats.set", events["chats.set"]);
+    }
+    if (events["chats.upsert"]) {
+      broadcast("chats.upsert", events["chats.upsert"]);
+    }
+    if (events["chats.update"]) {
+      broadcast("chats.update", events["chats.update"]);
     }
     if (events["messages.upsert"]) {
-      const { messages, type } = events["messages.upsert"];
-      broadcast("messages", { type, messages });
+      broadcast("messages", { type: "notify", messages: events["messages.upsert"].messages });
+    }
+    if (events["messages.update"]) {
+      broadcast("messages.update", events["messages.update"]);
     }
   });
 }
 
-// ====== ENDPOINTS ======
-app.get("/session/qr", async (req, res) => {
-  if (!qrData.qr) return res.json({ qr: null });
-  const dataUrl = await QRCode.toDataURL(qrData.qr);
-  res.json({ qr: dataUrl, ts: qrData.ts });
-});
+startSock();
 
-app.get("/session/status", (req, res) => {
-  const connected = !!(sock && sock.user);
-  res.json({ connected, user: sock?.user || null });
-});
+// ====== API Routes ======
 
-app.get("/chats", (req, res) => {
-  const chats = store.chats.all();
-  res.json({ count: chats.length, chats });
-});
-
-app.get("/messages", async (req, res) => {
-  const { jid, pageSize } = req.query;
-  if (!jid) return res.status(400).json({ error: "jid required" });
-
+// QR
+app.get("/session/qr", (req, res) => {
   try {
-    const msgs = await sock.fetchMessagesFromWA(jid, parseInt(pageSize || "25", 10));
-    res.json({ jid, messages: msgs });
+    const file = join(SESSION_DIR, "latest-qr.json");
+    if (!fs.existsSync(file)) return res.json({ qr: null });
+    const qr = JSON.parse(fs.readFileSync(file).toString());
+    return res.json({ qr: qr.qr || null });
   } catch (e) {
-    res.status(500).json({ error: String(e.message || e) });
+    return res.json({ qr: null });
   }
 });
 
+// Status
+app.get("/session/status", (req, res) => {
+  return res.json({ connected: !!sock?.user, user: sock?.user || null });
+});
+
+// Chats
+app.get("/chats", async (req, res) => {
+  try {
+    const chats = Object.values(sock?.store?.chats || {});
+    res.json({ count: chats.length, chats });
+  } catch (e) {
+    res.json({ count: 0, chats: [] });
+  }
+});
+
+// Messages
+app.get("/messages", async (req, res) => {
+  const { jid, pageSize = 25, cursorId } = req.query;
+  if (!jid) return res.status(400).json({ error: "jid required" });
+  try {
+    const msgs = await sock.store.loadMessages(jid, Number(pageSize), cursorId || undefined);
+    res.json({ count: msgs.length, messages: msgs });
+  } catch (e) {
+    res.json({ count: 0, messages: [] });
+  }
+});
+
+// Send message
 app.post("/messages/send", async (req, res) => {
   const { to, text } = req.body || {};
   if (!to || !text) return res.status(400).json({ error: "to & text required" });
@@ -156,29 +148,49 @@ app.post("/messages/send", async (req, res) => {
   try {
     const jid = jidNormalizedUser(to);
     const sent = await sock.sendMessage(jid, { text });
+
+    // eco inmediato al SSE
+    const msg = {
+      id: sent.key.id,
+      jid,
+      fromMe: true,
+      text,
+      ts: Math.floor(Date.now() / 1000),
+    };
+    broadcast("messages", { type: "sent", messages: [msg] });
+
     res.json({ ok: true, id: sent.key.id });
   } catch (e) {
     res.status(500).json({ error: String(e.message || e) });
   }
 });
 
+// ====== SSE Events ======
 app.get("/events", (req, res) => {
   res.writeHead(200, {
     "Content-Type": "text/event-stream",
     "Cache-Control": "no-cache",
     Connection: "keep-alive",
-    "Access-Control-Allow-Origin": ALLOWED_ORIGIN
+    "Access-Control-Allow-Origin": ALLOWED_ORIGIN,
   });
-  res.write("\n");
+
+  // hello inmediato
+  res.write(`event: hello\ndata: ${JSON.stringify({ connected: !!sock?.user })}\n\n`);
+
+  // heartbeat
+  const heartbeat = setInterval(() => {
+    try { res.write(`event: ping\ndata: "ok"\n\n`); } catch {}
+  }, 25000);
+
   sseClients.add(res);
-  req.on("close", () => sseClients.delete(res));
+
+  req.on("close", () => {
+    clearInterval(heartbeat);
+    sseClients.delete(res);
+  });
 });
 
-// ====== BOOT ======
+// ====== Start Server ======
 app.listen(PORT, () => {
   console.log(`Baileys microservice on :${PORT}`);
-  startSock().catch(err => {
-    console.error("Failed to start Baileys", err);
-    process.exit(1);
-  });
 });
